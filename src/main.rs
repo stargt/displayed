@@ -275,6 +275,13 @@ enum WatchEvent {
     Reconcile,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoWatchAction {
+    None,
+    DisabledInternal,
+    RestoredInternal,
+}
+
 struct DisplayEventRegistration {
     sender: *mut mpsc::Sender<WatchEvent>,
     registered: bool,
@@ -403,11 +410,15 @@ fn interactive_mode() -> AppResult<()> {
 
     if !targets.is_empty() {
         match apply_watch_targets(&targets, ActionMode::Execute, false, false) {
-            Ok(true) => {
+            Ok(AutoWatchAction::DisabledInternal) => {
                 status = "auto target matched; internal disabled".to_string();
                 parsed = load_display_state_for_ui(&mut selected, &mut status);
             }
-            Ok(false) => {}
+            Ok(AutoWatchAction::RestoredInternal) => {
+                status = "auto target absent; internal restore requested".to_string();
+                parsed = load_display_state_for_ui(&mut selected, &mut status);
+            }
+            Ok(AutoWatchAction::None) => {}
             Err(error) => status = format!("auto watch failed: {error}"),
         }
     }
@@ -500,11 +511,15 @@ fn interactive_mode() -> AppResult<()> {
                                     false,
                                     false,
                                 ) {
-                                    Ok(true) => {
+                                    Ok(AutoWatchAction::DisabledInternal) => {
                                         status =
                                             "auto target matched; internal disabled".to_string()
                                     }
-                                    Ok(false) => {}
+                                    Ok(AutoWatchAction::RestoredInternal) => {
+                                        status = "auto target absent; internal restore requested"
+                                            .to_string()
+                                    }
+                                    Ok(AutoWatchAction::None) => {}
                                     Err(error) => status = format!("auto watch failed: {error}"),
                                 }
                                 should_refresh = true;
@@ -528,10 +543,16 @@ fn interactive_mode() -> AppResult<()> {
                     should_refresh = true;
                     if !targets.is_empty() {
                         match apply_watch_targets(&targets, ActionMode::Execute, false, false) {
-                            Ok(true) => {
+                            Ok(AutoWatchAction::DisabledInternal) => {
                                 status = "auto target matched; internal disabled".to_string()
                             }
-                            Ok(false) => status = "display change detected".to_string(),
+                            Ok(AutoWatchAction::RestoredInternal) => {
+                                status =
+                                    "auto target absent; internal restore requested".to_string()
+                            }
+                            Ok(AutoWatchAction::None) => {
+                                status = "display change detected".to_string()
+                            }
                             Err(error) => status = format!("auto watch failed: {error}"),
                         }
                     } else {
@@ -543,10 +564,14 @@ fn interactive_mode() -> AppResult<()> {
                     should_refresh = true;
                     if !targets.is_empty() {
                         match apply_watch_targets(&targets, ActionMode::Execute, false, false) {
-                            Ok(true) => {
+                            Ok(AutoWatchAction::DisabledInternal) => {
                                 status = "auto target reconciled; internal disabled".to_string()
                             }
-                            Ok(false) => status = "periodic reconcile".to_string(),
+                            Ok(AutoWatchAction::RestoredInternal) => {
+                                status =
+                                    "auto target absent; internal restore requested".to_string()
+                            }
+                            Ok(AutoWatchAction::None) => status = "periodic reconcile".to_string(),
                             Err(error) => status = format!("auto watch failed: {error}"),
                         }
                     }
@@ -1400,31 +1425,20 @@ fn apply_watch_targets(
     mode: ActionMode,
     force: bool,
     verbose: bool,
-) -> AppResult<bool> {
+) -> AppResult<AutoWatchAction> {
     if targets.is_empty() {
-        return Ok(false);
+        return Ok(AutoWatchAction::None);
     }
 
-    let parsed = load_displayplacer()?;
+    let Some(parsed) = load_displayplacer_for_auto_watch(mode, verbose)? else {
+        return Ok(AutoWatchAction::RestoredInternal);
+    };
     remember_internal(&parsed);
 
     let target_present = parsed.displays.iter().any(|display| {
         display.is_enabled() && targets.iter().any(|target| target.matches_display(display))
     });
-    if !target_present {
-        return Ok(false);
-    }
-
-    if !parsed
-        .displays
-        .iter()
-        .any(|display| display.is_internal() && display.is_enabled())
-    {
-        return Ok(false);
-    }
-
-    disable_internal_once_with_verbosity(None, mode, force, false, verbose)?;
-    Ok(true)
+    apply_auto_watch_action(&parsed, target_present, None, mode, force, verbose)
 }
 
 fn apply_raw_watch_target(
@@ -1432,28 +1446,78 @@ fn apply_raw_watch_target(
     mode: ActionMode,
     force: bool,
     verbose: bool,
-) -> AppResult<bool> {
-    let parsed = load_displayplacer()?;
+) -> AppResult<AutoWatchAction> {
+    let Some(parsed) = load_displayplacer_for_auto_watch(mode, verbose)? else {
+        return Ok(AutoWatchAction::RestoredInternal);
+    };
     remember_internal(&parsed);
 
     let target_present = parsed
         .displays
         .iter()
         .any(|display| display.matches(target) && display.is_enabled());
-    if !target_present {
-        return Ok(false);
-    }
+    apply_auto_watch_action(&parsed, target_present, Some(target), mode, force, verbose)
+}
 
-    if !parsed
+fn apply_auto_watch_action(
+    parsed: &ParsedDisplayplacer,
+    target_present: bool,
+    raw_condition: Option<&str>,
+    mode: ActionMode,
+    force: bool,
+    verbose: bool,
+) -> AppResult<AutoWatchAction> {
+    match auto_watch_action_for_state(parsed, target_present) {
+        AutoWatchAction::DisabledInternal => {
+            disable_internal_once_with_verbosity(raw_condition, mode, force, false, verbose)?;
+            Ok(AutoWatchAction::DisabledInternal)
+        }
+        AutoWatchAction::RestoredInternal => {
+            restore_internal_once(None, mode, false, verbose)?;
+            Ok(AutoWatchAction::RestoredInternal)
+        }
+        AutoWatchAction::None => Ok(AutoWatchAction::None),
+    }
+}
+
+fn load_displayplacer_for_auto_watch(
+    mode: ActionMode,
+    verbose: bool,
+) -> AppResult<Option<ParsedDisplayplacer>> {
+    match load_displayplacer() {
+        Ok(parsed) => Ok(Some(parsed)),
+        Err(error) => {
+            if verbose {
+                eprintln!(
+                    "warning: display state unavailable; requesting internal restore: {error}"
+                );
+            }
+            restore_internal_once(None, mode, false, verbose)?;
+            Ok(None)
+        }
+    }
+}
+
+fn auto_watch_action_for_state(
+    parsed: &ParsedDisplayplacer,
+    target_present: bool,
+) -> AutoWatchAction {
+    let internal_enabled = parsed
         .displays
         .iter()
-        .any(|display| display.is_internal() && display.is_enabled())
-    {
-        return Ok(false);
-    }
+        .any(|display| display.is_internal() && display.is_enabled());
 
-    disable_internal_once_with_verbosity(Some(target), mode, force, false, verbose)?;
-    Ok(true)
+    if target_present {
+        if internal_enabled {
+            AutoWatchAction::DisabledInternal
+        } else {
+            AutoWatchAction::None
+        }
+    } else if internal_enabled {
+        AutoWatchAction::None
+    } else {
+        AutoWatchAction::RestoredInternal
+    }
 }
 
 fn watch(args: Vec<String>) -> AppResult<()> {
@@ -1512,8 +1576,13 @@ fn watch(args: Vec<String>) -> AppResult<()> {
             interval.as_secs()
         );
         match apply_raw_watch_target(target, mode, force, true) {
-            Ok(true) => println!("watch matched target; internal disabled"),
-            Ok(false) => {}
+            Ok(AutoWatchAction::DisabledInternal) => {
+                println!("watch matched target; internal disabled")
+            }
+            Ok(AutoWatchAction::RestoredInternal) => {
+                println!("watch target absent; internal restore requested")
+            }
+            Ok(AutoWatchAction::None) => {}
             Err(error) => eprintln!("watch iteration failed: {error}"),
         }
     } else {
@@ -1526,8 +1595,13 @@ fn watch(args: Vec<String>) -> AppResult<()> {
             println!("  - {}", target.summary());
         }
         match apply_watch_targets(&saved_targets, mode, force, true) {
-            Ok(true) => println!("watch matched saved target; internal disabled"),
-            Ok(false) => {}
+            Ok(AutoWatchAction::DisabledInternal) => {
+                println!("watch matched saved target; internal disabled")
+            }
+            Ok(AutoWatchAction::RestoredInternal) => {
+                println!("watch saved target absent; internal restore requested")
+            }
+            Ok(AutoWatchAction::None) => {}
             Err(error) => eprintln!("watch iteration failed: {error}"),
         }
     }
@@ -1538,14 +1612,24 @@ fn watch(args: Vec<String>) -> AppResult<()> {
             WatchEvent::DisplayChanged | WatchEvent::Reconcile => {
                 if let Some(target) = target.as_deref() {
                     match apply_raw_watch_target(target, mode, force, true) {
-                        Ok(true) => println!("watch matched target; internal disabled"),
-                        Ok(false) => {}
+                        Ok(AutoWatchAction::DisabledInternal) => {
+                            println!("watch matched target; internal disabled")
+                        }
+                        Ok(AutoWatchAction::RestoredInternal) => {
+                            println!("watch target absent; internal restore requested")
+                        }
+                        Ok(AutoWatchAction::None) => {}
                         Err(error) => eprintln!("watch iteration failed: {error}"),
                     }
                 } else {
                     match apply_watch_targets(&saved_targets, mode, force, true) {
-                        Ok(true) => println!("watch matched saved target; internal disabled"),
-                        Ok(false) => {}
+                        Ok(AutoWatchAction::DisabledInternal) => {
+                            println!("watch matched saved target; internal disabled")
+                        }
+                        Ok(AutoWatchAction::RestoredInternal) => {
+                            println!("watch saved target absent; internal restore requested")
+                        }
+                        Ok(AutoWatchAction::None) => {}
                         Err(error) => eprintln!("watch iteration failed: {error}"),
                     }
                 }
@@ -2520,5 +2604,74 @@ displayplacer "id:ABC enabled:true"
         assert_eq!(parsed.contextual_display_id(), Some(2));
         assert!(parsed.remembered_absent);
         assert!(!parsed.is_enabled());
+    }
+
+    #[test]
+    fn auto_watch_disables_internal_when_target_is_present() {
+        let parsed = parsed_with_displays(vec![internal_display(true), external_display(true)]);
+
+        assert_eq!(
+            auto_watch_action_for_state(&parsed, true),
+            AutoWatchAction::DisabledInternal
+        );
+    }
+
+    #[test]
+    fn auto_watch_leaves_internal_off_while_target_remains_present() {
+        let parsed = parsed_with_displays(vec![external_display(true)]);
+
+        assert_eq!(
+            auto_watch_action_for_state(&parsed, true),
+            AutoWatchAction::None
+        );
+    }
+
+    #[test]
+    fn auto_watch_restores_internal_when_target_is_absent_and_internal_is_off() {
+        let parsed = parsed_with_displays(vec![external_display(false)]);
+
+        assert_eq!(
+            auto_watch_action_for_state(&parsed, false),
+            AutoWatchAction::RestoredInternal
+        );
+    }
+
+    #[test]
+    fn auto_watch_does_not_restore_when_internal_is_already_enabled() {
+        let parsed = parsed_with_displays(vec![internal_display(true)]);
+
+        assert_eq!(
+            auto_watch_action_for_state(&parsed, false),
+            AutoWatchAction::None
+        );
+    }
+
+    fn parsed_with_displays(displays: Vec<Display>) -> ParsedDisplayplacer {
+        ParsedDisplayplacer {
+            displays,
+            restore_command: None,
+            raw: String::new(),
+        }
+    }
+
+    fn internal_display(enabled: bool) -> Display {
+        Display {
+            persistent_id: Some("INTERNAL".to_string()),
+            contextual_id: Some("1".to_string()),
+            display_type: Some("MacBook built in screen".to_string()),
+            enabled: Some(enabled),
+            ..Display::default()
+        }
+    }
+
+    fn external_display(enabled: bool) -> Display {
+        Display {
+            persistent_id: Some("EXTERNAL".to_string()),
+            contextual_id: Some("2".to_string()),
+            serial_id: Some("s456".to_string()),
+            display_type: Some("27 inch external screen".to_string()),
+            enabled: Some(enabled),
+            ..Display::default()
+        }
     }
 }

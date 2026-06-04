@@ -121,10 +121,12 @@ are only for current UI selection and are not used as the watch identity.
 
 While interactive mode is open, saved auto targets are always watched. If a
 saved target is connected, `displayed` automatically disables the internal
-display. The watch path registers a CoreGraphics display reconfiguration
-callback and also performs a periodic reconcile. The default reconcile interval
-is 60 seconds, so idle CPU use stays low while display hot-plug events can still
-be handled quickly.
+display. If no saved target is connected and the internal display is not
+enabled, `displayed` requests the native internal restore path so unplugging the
+external monitor does not leave the Mac without an active display. The watch
+path registers a CoreGraphics display reconfiguration callback and also performs
+a periodic reconcile. The default reconcile interval is 60 seconds, so idle CPU
+use stays low while display hot-plug events can still be handled quickly.
 
 ## Auto Targets
 
