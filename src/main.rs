@@ -1284,30 +1284,41 @@ fn safe_reset_once_with_verbosity(mode: ActionMode, verbose: bool) -> AppResult<
 }
 
 fn restore_internal_safety(mode: ActionMode, verbose: bool) -> AppResult<()> {
-    let delays: &[u64] = if mode == ActionMode::Execute {
-        &[0, 500, 1500]
-    } else {
-        &[0]
-    };
-    let mut succeeded = false;
+    if verbose {
+        println!("internal safety restore: redetect displays");
+    }
+    if let Err(error) = detect_displays(mode, verbose) {
+        if verbose {
+            eprintln!("warning: display redetection failed: {error}");
+        }
+    }
+
+    let remembered_display_ids = remembered_display_ids()?;
+    if remembered_display_ids.is_empty() {
+        if verbose {
+            eprintln!("warning: no remembered display ids; skipped native restore");
+        }
+        return Ok(());
+    }
+
+    let mut enabled_any = false;
     let mut last_error: Option<String> = None;
 
-    for delay in delays {
-        if *delay > 0 {
-            thread::sleep(Duration::from_millis(*delay));
+    for display_id in remembered_display_ids {
+        if verbose {
+            println!("internal safety restore: enable remembered display id {display_id}");
         }
-
-        match safe_reset_once_with_verbosity(mode, verbose) {
-            Ok(()) => succeeded = true,
+        match set_native_display_enabled(display_id, true, mode, verbose) {
+            Ok(()) => enabled_any = true,
             Err(error) => last_error = Some(error.to_string()),
         }
     }
 
-    if succeeded {
+    if enabled_any {
         Ok(())
     } else {
         Err(last_error
-            .unwrap_or_else(|| "internal safety restore did not run".to_string())
+            .unwrap_or_else(|| "internal safety restore did not enable any display".to_string())
             .into())
     }
 }
@@ -1483,14 +1494,16 @@ fn apply_interactive_display_recovery_for_change(
     force: bool,
     verbose: bool,
 ) -> AppResult<AutoWatchAction> {
-    if change.is_display_loss() {
-        restore_internal_safety(mode, verbose)?;
-        return Ok(AutoWatchAction::RestoredInternal);
+    match display_loss_restore_action_for_change(change, remembered_internal_display_id()?) {
+        AutoWatchAction::RestoredInternal => {
+            restore_internal_safety(mode, verbose)?;
+            return Ok(AutoWatchAction::RestoredInternal);
+        }
+        AutoWatchAction::None if change.is_display_loss() => return Ok(AutoWatchAction::None),
+        AutoWatchAction::None => {}
+        AutoWatchAction::DisabledInternal => {}
     }
 
-    if mode == ActionMode::Execute {
-        thread::sleep(Duration::from_millis(750));
-    }
     apply_interactive_display_recovery(targets, mode, force, verbose)
 }
 
@@ -1586,6 +1599,21 @@ fn load_displayplacer_for_auto_watch(
             Ok(None)
         }
     }
+}
+
+fn display_loss_restore_action_for_change(
+    change: DisplayChange,
+    internal_display_id: Option<CGDirectDisplayID>,
+) -> AutoWatchAction {
+    if !change.is_display_loss() {
+        return AutoWatchAction::None;
+    }
+
+    if internal_display_id == Some(change.display) {
+        return AutoWatchAction::None;
+    }
+
+    AutoWatchAction::RestoredInternal
 }
 
 fn auto_watch_action_for_state(
@@ -2339,6 +2367,13 @@ fn remembered_display_ids() -> AppResult<Vec<CGDirectDisplayID>> {
     Ok(ids.into_iter().collect())
 }
 
+fn remembered_internal_display_id() -> AppResult<Option<CGDirectDisplayID>> {
+    read_state_value("internal_display_id")?
+        .map(|value| value.parse::<CGDirectDisplayID>())
+        .transpose()
+        .map_err(Into::into)
+}
+
 fn read_support_file(file_name: &str) -> AppResult<Option<String>> {
     let path = support_file_path(file_name)?;
     match fs::read_to_string(&path) {
@@ -2796,6 +2831,45 @@ displayplacer "id:ABC enabled:true"
                 flags: 0,
             }
             .is_display_loss()
+        );
+    }
+
+    #[test]
+    fn display_loss_restore_ignores_remembered_internal_disable() {
+        let change = DisplayChange {
+            display: 1,
+            flags: K_CG_DISPLAY_DISABLED_FLAG,
+        };
+
+        assert_eq!(
+            display_loss_restore_action_for_change(change, Some(1)),
+            AutoWatchAction::None
+        );
+    }
+
+    #[test]
+    fn display_loss_restore_runs_for_external_remove() {
+        let change = DisplayChange {
+            display: 2,
+            flags: K_CG_DISPLAY_REMOVE_FLAG,
+        };
+
+        assert_eq!(
+            display_loss_restore_action_for_change(change, Some(1)),
+            AutoWatchAction::RestoredInternal
+        );
+    }
+
+    #[test]
+    fn display_loss_restore_stays_idle_for_non_loss_event() {
+        let change = DisplayChange {
+            display: 2,
+            flags: 0,
+        };
+
+        assert_eq!(
+            display_loss_restore_action_for_change(change, Some(1)),
+            AutoWatchAction::None
         );
     }
 
