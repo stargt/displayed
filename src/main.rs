@@ -135,6 +135,10 @@ impl Display {
     fn contextual_display_id(&self) -> Option<CGDirectDisplayID> {
         self.contextual_id.as_deref()?.parse().ok()
     }
+
+    fn has_stable_identity(&self) -> bool {
+        has_stable_display_identity(self.persistent_id.as_deref(), self.serial_id.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,10 +156,7 @@ impl MonitorTarget {
         if display.is_internal() {
             return None;
         }
-        if display.contextual_id.is_none()
-            && display.serial_id.is_none()
-            && display.persistent_id.is_none()
-        {
+        if !display.has_stable_identity() {
             return None;
         }
 
@@ -174,61 +175,43 @@ impl MonitorTarget {
             return false;
         }
 
-        if let (Some(target_serial), Some(display_serial)) =
-            (self.serial_id.as_deref(), display.serial_id.as_deref())
-        {
-            if normalize_id(target_serial) == normalize_id(display_serial) {
-                return true;
-            }
+        if same_stable_display_identity(
+            self.persistent_id.as_deref(),
+            self.serial_id.as_deref(),
+            display.persistent_id.as_deref(),
+            display.serial_id.as_deref(),
+        ) {
+            return true;
         }
 
-        if let (Some(target_contextual), Some(display_contextual)) = (
+        if self.has_stable_identity() || display.has_stable_identity() {
+            return false;
+        }
+
+        same_contextual_display_identity(
             self.contextual_id.as_deref(),
             display.contextual_id.as_deref(),
-        ) {
-            if normalize_id(target_contextual) == normalize_id(display_contextual) {
-                return true;
-            }
-        }
-
-        if let (Some(target_id), Some(display_id)) = (
-            self.persistent_id.as_deref(),
-            display.persistent_id.as_deref(),
-        ) {
-            if normalize_id(target_id) == normalize_id(display_id) {
-                return true;
-            }
-        }
-
-        false
+        )
     }
 
     fn same_identity(&self, other: &MonitorTarget) -> bool {
-        if let (Some(left), Some(right)) = (self.serial_id.as_deref(), other.serial_id.as_deref()) {
-            if normalize_id(left) == normalize_id(right) {
-                return true;
-            }
-        }
-
-        if let (Some(left), Some(right)) = (
+        if same_stable_display_identity(
             self.persistent_id.as_deref(),
+            self.serial_id.as_deref(),
             other.persistent_id.as_deref(),
+            other.serial_id.as_deref(),
         ) {
-            if normalize_id(left) == normalize_id(right) {
-                return true;
-            }
+            return true;
         }
 
-        if let (Some(left), Some(right)) = (
+        if self.has_stable_identity() || other.has_stable_identity() {
+            return false;
+        }
+
+        same_contextual_display_identity(
             self.contextual_id.as_deref(),
             other.contextual_id.as_deref(),
-        ) {
-            if normalize_id(left) == normalize_id(right) {
-                return true;
-            }
-        }
-
-        false
+        )
     }
 
     fn summary(&self) -> String {
@@ -255,6 +238,10 @@ impl MonitorTarget {
             remembered_absent: true,
             ..Display::default()
         }
+    }
+
+    fn has_stable_identity(&self) -> bool {
+        has_stable_display_identity(self.persistent_id.as_deref(), self.serial_id.as_deref())
     }
 }
 
@@ -1386,10 +1373,7 @@ fn parse_target_line(line: &str) -> Option<MonitorTarget> {
         }
     }
 
-    if target.contextual_id.is_none()
-        && target.serial_id.is_none()
-        && target.persistent_id.is_none()
-    {
+    if !target.has_stable_identity() {
         None
     } else {
         Some(target)
@@ -2133,31 +2117,6 @@ fn read_remembered_displays() -> AppResult<Vec<Display>> {
         }
     }
 
-    let internal_display_id = state_value_from_body(&state, "internal_display_id");
-    for value in state_values_from_body(&state, "known_display_id") {
-        if displays
-            .iter()
-            .any(|display| display.contextual_id.as_deref() == Some(value.as_str()))
-        {
-            continue;
-        }
-        let is_internal = internal_display_id.as_deref() == Some(value.as_str());
-        upsert_remembered_display(
-            &mut displays,
-            Display {
-                contextual_id: Some(value),
-                display_type: Some(if is_internal {
-                    "MacBook built in screen".to_string()
-                } else {
-                    "remembered external display".to_string()
-                }),
-                enabled: Some(false),
-                remembered_absent: true,
-                ..Display::default()
-            },
-        );
-    }
-
     Ok(displays)
 }
 
@@ -2177,26 +2136,45 @@ fn upsert_remembered_display(displays: &mut Vec<Display>, mut display: Display) 
 }
 
 fn same_display_identity(left: &Display, right: &Display) -> bool {
-    if let (Some(left), Some(right)) = (
+    if same_stable_display_identity(
+        left.persistent_id.as_deref(),
+        left.serial_id.as_deref(),
+        right.persistent_id.as_deref(),
+        right.serial_id.as_deref(),
+    ) {
+        return true;
+    }
+
+    if left.has_stable_identity() || right.has_stable_identity() {
+        return false;
+    }
+
+    same_contextual_display_identity(
         left.contextual_id.as_deref(),
         right.contextual_id.as_deref(),
-    ) {
-        if normalize_id(left) == normalize_id(right) {
-            return true;
-        }
-    }
+    )
+}
 
-    if let (Some(left), Some(right)) = (left.serial_id.as_deref(), right.serial_id.as_deref()) {
-        if normalize_id(left) == normalize_id(right) {
+fn same_stable_display_identity(
+    left_persistent: Option<&str>,
+    left_serial: Option<&str>,
+    right_persistent: Option<&str>,
+    right_serial: Option<&str>,
+) -> bool {
+    if let (Some(left), Some(right)) = (
+        normalized_persistent_identity(left_persistent),
+        normalized_persistent_identity(right_persistent),
+    ) {
+        if left == right {
             return true;
         }
     }
 
     if let (Some(left), Some(right)) = (
-        left.persistent_id.as_deref(),
-        right.persistent_id.as_deref(),
+        normalized_serial_identity(left_serial),
+        normalized_serial_identity(right_serial),
     ) {
-        if normalize_id(left) == normalize_id(right) {
+        if left == right {
             return true;
         }
     }
@@ -2204,11 +2182,44 @@ fn same_display_identity(left: &Display, right: &Display) -> bool {
     false
 }
 
-fn display_to_state_line(display: &Display) -> Option<String> {
-    if display.contextual_id.is_none()
-        && display.persistent_id.is_none()
-        && display.serial_id.is_none()
+fn same_contextual_display_identity(left: Option<&str>, right: Option<&str>) -> bool {
+    if let (Some(left), Some(right)) = (left, right) {
+        return normalize_id(left) == normalize_id(right);
+    }
+
+    false
+}
+
+fn has_stable_display_identity(persistent_id: Option<&str>, serial_id: Option<&str>) -> bool {
+    normalized_persistent_identity(persistent_id).is_some()
+        || normalized_serial_identity(serial_id).is_some()
+}
+
+fn normalized_persistent_identity(value: Option<&str>) -> Option<String> {
+    let normalized = value?.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "-" {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn normalized_serial_identity(value: Option<&str>) -> Option<String> {
+    let normalized = normalize_id(value?);
+    if normalized.is_empty()
+        || normalized == "-"
+        || normalized == "0"
+        || normalized == "unknown"
+        || normalized == "no serial"
     {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn display_to_state_line(display: &Display) -> Option<String> {
+    if !display.has_stable_identity() {
         return None;
     }
 
@@ -2246,19 +2257,16 @@ fn parse_display_state_line(raw: &str) -> Option<Display> {
         }
     }
 
-    if display.contextual_id.is_none()
-        && display.persistent_id.is_none()
-        && display.serial_id.is_none()
-    {
-        return None;
-    }
-
     if display.display_type.is_none() {
         display.display_type = Some(if internal_hint {
             "MacBook built in screen".to_string()
         } else {
             "remembered external display".to_string()
         });
+    }
+
+    if !display.has_stable_identity() {
+        return None;
     }
 
     Some(display)
@@ -2718,6 +2726,43 @@ displayplacer "id:ABC enabled:true"
     }
 
     #[test]
+    fn monitor_target_rejects_contextual_only_display() {
+        let display = Display {
+            contextual_id: Some("17".to_string()),
+            display_type: Some("remembered external display".to_string()),
+            enabled: Some(false),
+            remembered_absent: true,
+            ..Display::default()
+        };
+
+        assert!(MonitorTarget::from_display(&display).is_none());
+        assert!(parse_target_line("contextual=17\tlabel=remembered").is_none());
+    }
+
+    #[test]
+    fn monitor_target_does_not_match_stale_contextual_when_stable_identity_differs() {
+        let target = MonitorTarget {
+            contextual_id: Some("2".to_string()),
+            persistent_id: Some("TARGET".to_string()),
+            serial_id: Some("s123".to_string()),
+            display_type: Some("24 inch external screen".to_string()),
+            resolution: Some("1920x1080".to_string()),
+            label: "target".to_string(),
+        };
+        let display = Display {
+            contextual_id: Some("2".to_string()),
+            persistent_id: Some("OTHER".to_string()),
+            serial_id: Some("s456".to_string()),
+            display_type: Some("24 inch external screen".to_string()),
+            resolution: Some("1920x1080".to_string()),
+            enabled: Some(true),
+            ..Display::default()
+        };
+
+        assert!(!target.matches_display(&display));
+    }
+
+    #[test]
     fn serializes_remembered_display_rows() {
         let display = Display {
             persistent_id: Some("ABC".to_string()),
@@ -2737,6 +2782,66 @@ displayplacer "id:ABC enabled:true"
         assert_eq!(parsed.contextual_display_id(), Some(2));
         assert!(parsed.remembered_absent);
         assert!(!parsed.is_enabled());
+    }
+
+    #[test]
+    fn remembered_display_rows_require_stable_identity() {
+        let display = Display {
+            contextual_id: Some("17".to_string()),
+            display_type: Some("remembered external display".to_string()),
+            enabled: Some(false),
+            remembered_absent: true,
+            ..Display::default()
+        };
+
+        assert!(display_to_state_line(&display).is_none());
+        assert!(
+            parse_display_state_line(
+                "contextual=17\ttype=remembered external display\tinternal=false"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn remembered_display_identity_prefers_stable_ids_over_contextual_ids() {
+        let remembered = Display {
+            contextual_id: Some("2".to_string()),
+            persistent_id: Some("ABC".to_string()),
+            serial_id: Some("s123".to_string()),
+            display_type: Some("24 inch external screen".to_string()),
+            resolution: Some("1920x1080".to_string()),
+            enabled: Some(false),
+            remembered_absent: true,
+            ..Display::default()
+        };
+        let same_display_new_contextual = Display {
+            contextual_id: Some("9".to_string()),
+            persistent_id: Some("ABC".to_string()),
+            serial_id: Some("s123".to_string()),
+            display_type: Some("24 inch external screen".to_string()),
+            resolution: Some("1920x1080".to_string()),
+            enabled: Some(true),
+            ..Display::default()
+        };
+        let different_display_same_contextual = Display {
+            contextual_id: Some("2".to_string()),
+            persistent_id: Some("DEF".to_string()),
+            serial_id: Some("s456".to_string()),
+            display_type: Some("27 inch external screen".to_string()),
+            resolution: Some("2560x1440".to_string()),
+            enabled: Some(true),
+            ..Display::default()
+        };
+
+        assert!(same_display_identity(
+            &remembered,
+            &same_display_new_contextual
+        ));
+        assert!(!same_display_identity(
+            &remembered,
+            &different_display_same_contextual
+        ));
     }
 
     #[test]
