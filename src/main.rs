@@ -22,12 +22,14 @@ type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 const STATE_FILE_NAME: &str = "state";
 const TARGETS_FILE_NAME: &str = "targets";
 const DEFAULT_WATCH_INTERVAL_SECS: u64 = 60;
-const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = 60;
+const DEFAULT_INTERACTIVE_RECONCILE_INTERVAL_SECS: u64 = 5;
 type CGDirectDisplayID = u32;
 type CGDisplayChangeSummaryFlags = u32;
 type CGDisplayConfigRef = *mut std::ffi::c_void;
 type CGError = i32;
 const K_CG_CONFIGURE_PERMANENTLY: i32 = 1;
+const K_CG_DISPLAY_REMOVE_FLAG: CGDisplayChangeSummaryFlags = 1 << 5;
+const K_CG_DISPLAY_DISABLED_FLAG: CGDisplayChangeSummaryFlags = 1 << 9;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -271,8 +273,20 @@ enum ActionMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchEvent {
-    DisplayChanged,
+    DisplayChanged(DisplayChange),
     Reconcile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisplayChange {
+    display: CGDirectDisplayID,
+    flags: CGDisplayChangeSummaryFlags,
+}
+
+impl DisplayChange {
+    fn is_display_loss(self) -> bool {
+        self.flags & (K_CG_DISPLAY_REMOVE_FLAG | K_CG_DISPLAY_DISABLED_FLAG) != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,7 +413,7 @@ fn list_displays() -> AppResult<()> {
 fn interactive_mode() -> AppResult<()> {
     let _terminal = TerminalGuard::enter()?;
     let (watch_rx, _display_events, event_status) =
-        start_display_event_source(DEFAULT_RECONCILE_INTERVAL_SECS);
+        start_display_event_source(DEFAULT_INTERACTIVE_RECONCILE_INTERVAL_SECS);
     let mut targets = load_targets()?;
     let mut selected = 0usize;
     let mut status = event_status.unwrap_or_else(|| "ready".to_string());
@@ -535,10 +549,11 @@ fn interactive_mode() -> AppResult<()> {
 
         while let Ok(event) = watch_rx.try_recv() {
             match event {
-                WatchEvent::DisplayChanged => {
+                WatchEvent::DisplayChanged(change) => {
                     should_refresh = true;
-                    match apply_interactive_display_recovery(
+                    match apply_interactive_display_recovery_for_change(
                         &targets,
+                        change,
                         ActionMode::Execute,
                         false,
                         false,
@@ -1268,6 +1283,35 @@ fn safe_reset_once_with_verbosity(mode: ActionMode, verbose: bool) -> AppResult<
     Ok(())
 }
 
+fn restore_internal_safety(mode: ActionMode, verbose: bool) -> AppResult<()> {
+    let delays: &[u64] = if mode == ActionMode::Execute {
+        &[0, 500, 1500]
+    } else {
+        &[0]
+    };
+    let mut succeeded = false;
+    let mut last_error: Option<String> = None;
+
+    for delay in delays {
+        if *delay > 0 {
+            thread::sleep(Duration::from_millis(*delay));
+        }
+
+        match safe_reset_once_with_verbosity(mode, verbose) {
+            Ok(()) => succeeded = true,
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+
+    if succeeded {
+        Ok(())
+    } else {
+        Err(last_error
+            .unwrap_or_else(|| "internal safety restore did not run".to_string())
+            .into())
+    }
+}
+
 fn load_targets() -> AppResult<Vec<MonitorTarget>> {
     let Some(raw) = read_support_file(TARGETS_FILE_NAME)? else {
         return Ok(Vec::new());
@@ -1432,6 +1476,24 @@ fn apply_interactive_display_recovery(
     apply_no_enabled_display_safety(mode, verbose)
 }
 
+fn apply_interactive_display_recovery_for_change(
+    targets: &[MonitorTarget],
+    change: DisplayChange,
+    mode: ActionMode,
+    force: bool,
+    verbose: bool,
+) -> AppResult<AutoWatchAction> {
+    if change.is_display_loss() {
+        restore_internal_safety(mode, verbose)?;
+        return Ok(AutoWatchAction::RestoredInternal);
+    }
+
+    if mode == ActionMode::Execute {
+        thread::sleep(Duration::from_millis(750));
+    }
+    apply_interactive_display_recovery(targets, mode, force, verbose)
+}
+
 fn apply_no_enabled_display_safety(mode: ActionMode, verbose: bool) -> AppResult<AutoWatchAction> {
     let Some(parsed) = load_displayplacer_for_auto_watch(mode, verbose)? else {
         return Ok(AutoWatchAction::RestoredInternal);
@@ -1440,7 +1502,7 @@ fn apply_no_enabled_display_safety(mode: ActionMode, verbose: bool) -> AppResult
 
     match no_enabled_display_safety_action_for_state(&parsed) {
         AutoWatchAction::RestoredInternal => {
-            restore_internal_once(None, mode, false, verbose)?;
+            restore_internal_safety(mode, verbose)?;
             Ok(AutoWatchAction::RestoredInternal)
         }
         AutoWatchAction::None => Ok(AutoWatchAction::None),
@@ -1501,7 +1563,7 @@ fn apply_auto_watch_action(
             Ok(AutoWatchAction::DisabledInternal)
         }
         AutoWatchAction::RestoredInternal => {
-            restore_internal_once(None, mode, false, verbose)?;
+            restore_internal_safety(mode, verbose)?;
             Ok(AutoWatchAction::RestoredInternal)
         }
         AutoWatchAction::None => Ok(AutoWatchAction::None),
@@ -1520,7 +1582,7 @@ fn load_displayplacer_for_auto_watch(
                     "warning: display state unavailable; requesting internal restore: {error}"
                 );
             }
-            restore_internal_once(None, mode, false, verbose)?;
+            restore_internal_safety(mode, verbose)?;
             Ok(None)
         }
     }
@@ -1645,7 +1707,7 @@ fn watch(args: Vec<String>) -> AppResult<()> {
     loop {
         let event = events.recv()?;
         match event {
-            WatchEvent::DisplayChanged | WatchEvent::Reconcile => {
+            WatchEvent::DisplayChanged(_) | WatchEvent::Reconcile => {
                 if let Some(target) = target.as_deref() {
                     match apply_raw_watch_target(target, mode, force, true) {
                         Ok(AutoWatchAction::DisabledInternal) => {
@@ -1720,8 +1782,8 @@ fn register_display_reconfiguration_callback(
 }
 
 unsafe extern "C" fn display_reconfiguration_callback(
-    _display: CGDirectDisplayID,
-    _flags: CGDisplayChangeSummaryFlags,
+    display: CGDirectDisplayID,
+    flags: CGDisplayChangeSummaryFlags,
     user_info: *mut std::ffi::c_void,
 ) {
     if user_info.is_null() {
@@ -1729,7 +1791,7 @@ unsafe extern "C" fn display_reconfiguration_callback(
     }
 
     let sender = unsafe { &*(user_info as *const mpsc::Sender<WatchEvent>) };
-    let _ = sender.send(WatchEvent::DisplayChanged);
+    let _ = sender.send(WatchEvent::DisplayChanged(DisplayChange { display, flags }));
 }
 
 fn disable_internal_once(
@@ -2709,6 +2771,31 @@ displayplacer "id:ABC enabled:true"
         assert_eq!(
             no_enabled_display_safety_action_for_state(&parsed),
             AutoWatchAction::None
+        );
+    }
+
+    #[test]
+    fn display_change_detects_remove_or_disable_flags_as_display_loss() {
+        assert!(
+            DisplayChange {
+                display: 2,
+                flags: K_CG_DISPLAY_REMOVE_FLAG,
+            }
+            .is_display_loss()
+        );
+        assert!(
+            DisplayChange {
+                display: 2,
+                flags: K_CG_DISPLAY_DISABLED_FLAG,
+            }
+            .is_display_loss()
+        );
+        assert!(
+            !DisplayChange {
+                display: 2,
+                flags: 0,
+            }
+            .is_display_loss()
         );
     }
 

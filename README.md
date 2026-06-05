@@ -126,9 +126,11 @@ enabled, `displayed` requests the native internal restore path so unplugging the
 external monitor does not leave the Mac without an active display. The watch
 path registers a CoreGraphics display reconfiguration callback and also performs
 a periodic reconcile. Interactive mode also applies this no-enabled-display
-safety restore even when no auto target is saved. The default reconcile interval
-is 60 seconds, so idle CPU use stays low while display hot-plug events can still
-be handled quickly.
+safety restore even when no auto target is saved. When CoreGraphics reports a
+display remove/disable event, interactive mode runs the safety restore before
+trusting the latest `displayplacer` state because that state can be stale during
+hot unplug. Interactive mode reconciles every 5 seconds; non-interactive watch
+uses the requested interval, defaulting to 60 seconds.
 
 ## Auto Targets
 
