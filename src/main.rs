@@ -5,10 +5,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::{
     cursor,
@@ -21,15 +22,32 @@ use crossterm::{
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 const STATE_FILE_NAME: &str = "state";
 const TARGETS_FILE_NAME: &str = "targets";
+const GUARD_LABEL: &str = "com.stargt.displayed.guard";
 const DEFAULT_WATCH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_INTERACTIVE_RECONCILE_INTERVAL_SECS: u64 = 5;
+const DEFAULT_GUARD_INTERVAL_SECS: u64 = 30;
 type CGDirectDisplayID = u32;
 type CGDisplayChangeSummaryFlags = u32;
 type CGDisplayConfigRef = *mut std::ffi::c_void;
 type CGError = i32;
+type CFRunLoopRef = *mut std::ffi::c_void;
+type CFRunLoopSourceRef = *mut std::ffi::c_void;
+type CFStringRef = *const std::ffi::c_void;
+type IoConnect = u32;
+type IoObject = u32;
+type IoService = u32;
+type IoNotificationPortRef = *mut std::ffi::c_void;
+type IoReturn = i32;
+type Natural = u32;
 const K_CG_CONFIGURE_PERMANENTLY: i32 = 1;
 const K_CG_DISPLAY_REMOVE_FLAG: CGDisplayChangeSummaryFlags = 1 << 5;
 const K_CG_DISPLAY_DISABLED_FLAG: CGDisplayChangeSummaryFlags = 1 << 9;
+const K_IO_MESSAGE_CAN_SYSTEM_SLEEP: Natural = 0xe0000270;
+const K_IO_MESSAGE_SYSTEM_WILL_SLEEP: Natural = 0xe0000280;
+const K_IO_MESSAGE_SYSTEM_WILL_POWER_ON: Natural = 0xe0000320;
+const K_IO_MESSAGE_SYSTEM_HAS_POWERED_ON: Natural = 0xe0000300;
+static POWER_ROOT_PORT: AtomicU32 = AtomicU32::new(0);
+static POWER_DRY_RUN: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -54,12 +72,37 @@ unsafe extern "C" {
 type CGDisplayReconfigurationCallBack =
     unsafe extern "C" fn(CGDirectDisplayID, CGDisplayChangeSummaryFlags, *mut std::ffi::c_void);
 
+type IoServiceInterestCallback =
+    unsafe extern "C" fn(*mut std::ffi::c_void, IoService, Natural, *mut std::ffi::c_void);
+
 unsafe extern "C" {
     fn dlopen(path: *const std::ffi::c_char, mode: i32) -> *mut std::ffi::c_void;
     fn dlsym(
         handle: *mut std::ffi::c_void,
         symbol: *const std::ffi::c_char,
     ) -> *mut std::ffi::c_void;
+}
+
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    fn IORegisterForSystemPower(
+        refcon: *mut std::ffi::c_void,
+        the_port_ref: *mut IoNotificationPortRef,
+        callback: IoServiceInterestCallback,
+        notifier: *mut IoObject,
+    ) -> IoConnect;
+    fn IOAllowPowerChange(kernel_port: IoConnect, notification_id: isize) -> IoReturn;
+    fn IODeregisterForSystemPower(notifier: *mut IoObject) -> IoReturn;
+    fn IONotificationPortGetRunLoopSource(notify: IoNotificationPortRef) -> CFRunLoopSourceRef;
+    fn IONotificationPortDestroy(notify: IoNotificationPortRef);
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    fn CFRunLoopRun();
+    static kCFRunLoopDefaultMode: CFStringRef;
 }
 
 const RTLD_LAZY: i32 = 0x1;
@@ -265,6 +308,25 @@ enum WatchEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerEvent {
+    SystemWillPowerOn,
+    SystemHasPoweredOn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClamshellState {
+    Open,
+    Closed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardAction {
+    None,
+    RestoreInternal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DisplayChange {
     display: CGDirectDisplayID,
     flags: CGDisplayChangeSummaryFlags,
@@ -300,6 +362,33 @@ impl Drop for DisplayEventRegistration {
             if !self.sender.is_null() {
                 drop(Box::from_raw(self.sender));
             }
+        }
+    }
+}
+
+struct PowerEventRegistration {
+    sender: *mut mpsc::Sender<PowerEvent>,
+    notification_port: IoNotificationPortRef,
+    notifier: IoObject,
+    root_port: IoConnect,
+    registered: bool,
+}
+
+impl Drop for PowerEventRegistration {
+    fn drop(&mut self) {
+        unsafe {
+            if self.registered {
+                let _ = IODeregisterForSystemPower(&mut self.notifier);
+            }
+            if !self.notification_port.is_null() {
+                IONotificationPortDestroy(self.notification_port);
+            }
+            if !self.sender.is_null() {
+                drop(Box::from_raw(self.sender));
+            }
+        }
+        if self.root_port != 0 {
+            POWER_ROOT_PORT.store(0, Ordering::SeqCst);
         }
     }
 }
@@ -346,6 +435,9 @@ fn run() -> AppResult<()> {
         "redetect-displays" => redetect_displays(args.collect())?,
         "safe-reset" | "reset-safe" => safe_reset(args.collect())?,
         "targets" => targets_command(args.collect())?,
+        "guard" => guard(args.collect())?,
+        "install-guard" => install_guard(args.collect())?,
+        "uninstall-guard" => uninstall_guard(args.collect())?,
         "watch" => watch(args.collect())?,
         unknown => {
             return Err(format!("unknown command `{unknown}`. Run `displayed --help`.").into());
@@ -371,11 +463,16 @@ Commands:
   displayed redetect-displays [--dry-run]
   displayed safe-reset [--dry-run]
   displayed targets [--clear]
+  displayed guard [--reason REASON] [--dry-run] [--quiet]
+  displayed install-guard [--interval SECONDS] [--no-load] [--dry-run]
+  displayed uninstall-guard [--no-unload] [--dry-run]
   displayed watch [--target-id ID | --target-serial SERIAL] [--interval SECONDS] [--dry-run] [--force]
 
 Notes:
   - Running without arguments opens interactive mode.
   - `displayed watch` without a target uses monitors saved in interactive mode.
+  - `displayed guard` is restore-only; it never disables the internal display.
+  - `displayed install-guard` installs a one-shot launchd safety guard for crash/stuck recovery.
   - Display IDs come from the contextual ID shown by `displayed list`.
   - SERIAL may be either `12345` or `s12345`.
   - `--force` allows disabling even when only one enabled display is reported.
@@ -401,9 +498,23 @@ fn interactive_mode() -> AppResult<()> {
     let _terminal = TerminalGuard::enter()?;
     let (watch_rx, _display_events, event_status) =
         start_display_event_source(DEFAULT_INTERACTIVE_RECONCILE_INTERVAL_SECS);
+    POWER_DRY_RUN.store(false, Ordering::SeqCst);
+    let (power_rx, _power_events, power_status) = match start_power_event_source() {
+        Ok((rx, registration)) => (rx, Some(registration), None),
+        Err(error) => {
+            let (_tx, rx) = mpsc::channel();
+            (
+                rx,
+                None,
+                Some(format!("power event registration failed: {error}")),
+            )
+        }
+    };
     let mut targets = load_targets()?;
     let mut selected = 0usize;
-    let mut status = event_status.unwrap_or_else(|| "ready".to_string());
+    let mut status = event_status
+        .or(power_status)
+        .unwrap_or_else(|| "ready".to_string());
     let mut parsed = load_display_state_for_ui(&mut selected, &mut status);
     let mut width = terminal::size()
         .map(|(columns, _)| columns as usize)
@@ -576,6 +687,19 @@ fn interactive_mode() -> AppResult<()> {
                     needs_render = true;
                 }
             }
+        }
+
+        while let Ok(event) = power_rx.try_recv() {
+            let reason = match event {
+                PowerEvent::SystemWillPowerOn => "system-will-power-on",
+                PowerEvent::SystemHasPoweredOn => "system-has-powered-on",
+            };
+            should_refresh = true;
+            match run_internal_guard_once(reason, ActionMode::Execute, false) {
+                Ok(()) => status = format!("power event reconciled: {reason}"),
+                Err(error) => status = format!("power event recovery failed: {error}"),
+            }
+            needs_render = true;
         }
 
         if should_refresh {
@@ -1308,6 +1432,475 @@ fn restore_internal_safety(mode: ActionMode, verbose: bool) -> AppResult<()> {
             .unwrap_or_else(|| "internal safety restore did not enable any display".to_string())
             .into())
     }
+}
+
+fn guard(args: Vec<String>) -> AppResult<()> {
+    let mut mode = ActionMode::Execute;
+    let mut reason = "manual".to_string();
+    let mut verbose = true;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" => mode = ActionMode::DryRun,
+            "--quiet" => verbose = false,
+            "--reason" => {
+                i += 1;
+                reason = args
+                    .get(i)
+                    .ok_or("missing value after --reason")?
+                    .to_string();
+            }
+            other => return Err(format!("unknown guard option `{other}`").into()),
+        }
+        i += 1;
+    }
+
+    run_internal_guard_once(&reason, mode, verbose)
+}
+
+fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> AppResult<()> {
+    if verbose {
+        println!("guard: reason={reason}");
+    }
+
+    if let Err(error) = detect_displays(mode, verbose) {
+        if verbose {
+            eprintln!("warning: display redetection failed: {error}");
+        }
+    }
+
+    let clamshell = read_clamshell_state(verbose);
+    let parsed = load_displayplacer_with_timeout(Duration::from_secs(2));
+    let action = match parsed.as_ref() {
+        Ok(parsed) => {
+            if mode == ActionMode::Execute {
+                remember_internal(parsed);
+            }
+            internal_guard_action_for_state(clamshell, Some(parsed))
+        }
+        Err(error) => {
+            if verbose {
+                eprintln!("warning: guard display state unavailable: {error}");
+            }
+            internal_guard_action_for_state(clamshell, None)
+        }
+    };
+
+    match action {
+        GuardAction::None => {
+            if verbose {
+                println!("guard: no internal restore needed");
+            }
+            Ok(())
+        }
+        GuardAction::RestoreInternal => {
+            if verbose {
+                println!("guard: restoring internal display");
+            }
+            restore_internal_only_safety(mode, verbose)
+        }
+    }
+}
+
+fn restore_internal_only_safety(mode: ActionMode, verbose: bool) -> AppResult<()> {
+    if let Err(error) = restore_internal_once(None, mode, false, verbose) {
+        if verbose {
+            eprintln!("warning: native internal restore failed: {error}");
+        }
+    }
+
+    let parsed = match load_displayplacer_with_timeout(Duration::from_secs(2)) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            if verbose {
+                eprintln!("warning: could not verify internal restore: {error}");
+            }
+            return Ok(());
+        }
+    };
+    if mode == ActionMode::Execute {
+        remember_internal(&parsed);
+    }
+
+    if parsed
+        .displays
+        .iter()
+        .any(|display| display.is_internal() && display.is_enabled())
+    {
+        return Ok(());
+    }
+
+    for display in parsed
+        .displays
+        .iter()
+        .filter(|display| display.is_internal() && !display.is_enabled())
+    {
+        let Some(id) = display.stable_id() else {
+            continue;
+        };
+        if let Err(error) = set_displayplacer_enabled(id, true, mode, verbose) {
+            if verbose {
+                eprintln!("warning: displayplacer internal restore failed: {error}");
+            }
+        }
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+fn internal_guard_action_for_state(
+    clamshell: ClamshellState,
+    parsed: Option<&ParsedDisplayplacer>,
+) -> GuardAction {
+    if clamshell == ClamshellState::Closed {
+        return GuardAction::None;
+    }
+
+    let Some(parsed) = parsed else {
+        return GuardAction::RestoreInternal;
+    };
+
+    let internal_enabled = parsed
+        .displays
+        .iter()
+        .any(|display| display.is_internal() && display.is_enabled());
+    if internal_enabled {
+        return GuardAction::None;
+    }
+
+    let external_enabled = parsed
+        .displays
+        .iter()
+        .any(|display| !display.is_internal() && display.is_enabled());
+    if external_enabled {
+        return GuardAction::None;
+    }
+
+    GuardAction::RestoreInternal
+}
+
+fn read_clamshell_state(verbose: bool) -> ClamshellState {
+    match run_command_with_timeout(
+        "ioreg",
+        &["-r", "-k", "AppleClamshellState", "-d", "4"],
+        Duration::from_secs(1),
+    ) {
+        Ok(output) => {
+            let body = String::from_utf8_lossy(&output.stdout);
+            if body.contains("\"AppleClamshellState\" = Yes") {
+                ClamshellState::Closed
+            } else if body.contains("\"AppleClamshellState\" = No") {
+                ClamshellState::Open
+            } else {
+                ClamshellState::Unknown
+            }
+        }
+        Err(error) => {
+            if verbose {
+                eprintln!("warning: clamshell state unavailable: {error}");
+            }
+            ClamshellState::Unknown
+        }
+    }
+}
+
+fn start_power_event_source() -> AppResult<(Receiver<PowerEvent>, PowerEventRegistration)> {
+    let (tx, rx) = mpsc::channel();
+    let sender = Box::into_raw(Box::new(tx));
+    let mut notification_port: IoNotificationPortRef = std::ptr::null_mut();
+    let mut notifier: IoObject = 0;
+    let root_port = unsafe {
+        IORegisterForSystemPower(
+            sender.cast(),
+            &mut notification_port,
+            power_event_callback,
+            &mut notifier,
+        )
+    };
+
+    if root_port == 0 || notification_port.is_null() {
+        unsafe {
+            drop(Box::from_raw(sender));
+        }
+        return Err("IORegisterForSystemPower failed".into());
+    }
+
+    POWER_ROOT_PORT.store(root_port, Ordering::SeqCst);
+    let source = unsafe { IONotificationPortGetRunLoopSource(notification_port) };
+    let source_addr = source as usize;
+    thread::spawn(move || unsafe {
+        let run_loop = CFRunLoopGetCurrent();
+        CFRunLoopAddSource(
+            run_loop,
+            source_addr as CFRunLoopSourceRef,
+            kCFRunLoopDefaultMode,
+        );
+        CFRunLoopRun();
+    });
+
+    Ok((
+        rx,
+        PowerEventRegistration {
+            sender,
+            notification_port,
+            notifier,
+            root_port,
+            registered: true,
+        },
+    ))
+}
+
+unsafe extern "C" fn power_event_callback(
+    refcon: *mut std::ffi::c_void,
+    _service: IoService,
+    message_type: Natural,
+    message_argument: *mut std::ffi::c_void,
+) {
+    let root_port = POWER_ROOT_PORT.load(Ordering::SeqCst);
+    if message_type == K_IO_MESSAGE_CAN_SYSTEM_SLEEP {
+        if root_port != 0 {
+            let _ = unsafe { IOAllowPowerChange(root_port, message_argument as isize) };
+        }
+        return;
+    }
+
+    if message_type == K_IO_MESSAGE_SYSTEM_WILL_SLEEP {
+        let mode = if POWER_DRY_RUN.load(Ordering::SeqCst) {
+            ActionMode::DryRun
+        } else {
+            ActionMode::Execute
+        };
+        let _ = restore_internal_only_safety(mode, false);
+        if root_port != 0 {
+            let _ = unsafe { IOAllowPowerChange(root_port, message_argument as isize) };
+        }
+        return;
+    }
+
+    if refcon.is_null() {
+        return;
+    }
+    let sender = unsafe { &*(refcon as *const mpsc::Sender<PowerEvent>) };
+    match message_type {
+        K_IO_MESSAGE_SYSTEM_WILL_POWER_ON => {
+            let _ = sender.send(PowerEvent::SystemWillPowerOn);
+        }
+        K_IO_MESSAGE_SYSTEM_HAS_POWERED_ON => {
+            let _ = sender.send(PowerEvent::SystemHasPoweredOn);
+        }
+        _ => {}
+    }
+}
+
+fn install_guard(args: Vec<String>) -> AppResult<()> {
+    let mut interval = DEFAULT_GUARD_INTERVAL_SECS;
+    let mut load = true;
+    let mut mode = ActionMode::Execute;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--interval" => {
+                i += 1;
+                interval = args
+                    .get(i)
+                    .ok_or("missing value after --interval")?
+                    .parse::<u64>()?
+                    .max(5);
+            }
+            "--no-load" => load = false,
+            "--dry-run" => mode = ActionMode::DryRun,
+            other => return Err(format!("unknown install-guard option `{other}`").into()),
+        }
+        i += 1;
+    }
+
+    let exe = env::current_exe()?.canonicalize()?;
+    let launch_agents = launch_agents_dir()?;
+    let logs_dir = logs_dir()?;
+    let guard_plist = launch_agents.join(format!("{GUARD_LABEL}.plist"));
+
+    let guard_body = launch_agent_plist(
+        GUARD_LABEL,
+        &[
+            exe.to_string_lossy().as_ref(),
+            "guard",
+            "--reason",
+            "launchd",
+            "--quiet",
+        ],
+        Some(interval),
+        false,
+        &logs_dir.join("displayed-guard.log"),
+        &logs_dir.join("displayed-guard.err.log"),
+    );
+
+    if mode == ActionMode::DryRun {
+        println!("dry-run: write {}", guard_plist.display());
+        println!("{guard_body}");
+    } else {
+        fs::create_dir_all(&launch_agents)?;
+        fs::create_dir_all(&logs_dir)?;
+        fs::write(&guard_plist, guard_body)?;
+        println!("installed {}", guard_plist.display());
+    }
+
+    if load {
+        load_launch_agent(GUARD_LABEL, &guard_plist, mode)?;
+    }
+
+    Ok(())
+}
+
+fn uninstall_guard(args: Vec<String>) -> AppResult<()> {
+    let mut unload = true;
+    let mut mode = ActionMode::Execute;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-unload" => unload = false,
+            "--dry-run" => mode = ActionMode::DryRun,
+            other => return Err(format!("unknown uninstall-guard option `{other}`").into()),
+        }
+        i += 1;
+    }
+
+    let launch_agents = launch_agents_dir()?;
+    let guard_plist = launch_agents.join(format!("{GUARD_LABEL}.plist"));
+
+    if unload {
+        unload_launch_agent(GUARD_LABEL, mode)?;
+    }
+
+    if mode == ActionMode::DryRun {
+        println!("dry-run: remove {}", guard_plist.display());
+    } else if guard_plist.exists() {
+        fs::remove_file(&guard_plist)?;
+        println!("removed {}", guard_plist.display());
+    }
+
+    Ok(())
+}
+
+fn launch_agent_plist(
+    label: &str,
+    arguments: &[&str],
+    start_interval: Option<u64>,
+    keep_alive: bool,
+    stdout_path: &std::path::Path,
+    stderr_path: &std::path::Path,
+) -> String {
+    let mut body = String::new();
+    body.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    body.push_str("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
+    body.push_str("<plist version=\"1.0\">\n<dict>\n");
+    body.push_str("  <key>Label</key>\n");
+    body.push_str(&format!("  <string>{}</string>\n", xml_escape(label)));
+    body.push_str("  <key>ProgramArguments</key>\n  <array>\n");
+    for argument in arguments {
+        body.push_str(&format!("    <string>{}</string>\n", xml_escape(argument)));
+    }
+    body.push_str("  </array>\n");
+    body.push_str("  <key>RunAtLoad</key>\n  <true/>\n");
+    if keep_alive {
+        body.push_str("  <key>KeepAlive</key>\n  <true/>\n");
+    }
+    if let Some(interval) = start_interval {
+        body.push_str("  <key>StartInterval</key>\n");
+        body.push_str(&format!("  <integer>{interval}</integer>\n"));
+    }
+    body.push_str("  <key>LimitLoadToSessionType</key>\n  <string>Aqua</string>\n");
+    body.push_str("  <key>StandardOutPath</key>\n");
+    body.push_str(&format!(
+        "  <string>{}</string>\n",
+        xml_escape(&stdout_path.to_string_lossy())
+    ));
+    body.push_str("  <key>StandardErrorPath</key>\n");
+    body.push_str(&format!(
+        "  <string>{}</string>\n",
+        xml_escape(&stderr_path.to_string_lossy())
+    ));
+    body.push_str("</dict>\n</plist>\n");
+    body
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn launch_agents_dir() -> AppResult<PathBuf> {
+    Ok(home_dir()?.join("Library").join("LaunchAgents"))
+}
+
+fn logs_dir() -> AppResult<PathBuf> {
+    Ok(home_dir()?.join("Library").join("Logs"))
+}
+
+fn home_dir() -> AppResult<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".into())
+}
+
+fn load_launch_agent(label: &str, plist: &std::path::Path, mode: ActionMode) -> AppResult<()> {
+    if mode == ActionMode::DryRun {
+        println!("dry-run: launchctl bootstrap gui/<uid> {}", plist.display());
+        println!("dry-run: launchctl kickstart -k gui/<uid>/{label}");
+        return Ok(());
+    }
+
+    unload_launch_agent(label, mode)?;
+    let domain = launchd_gui_domain()?;
+    run_launchctl(&["bootstrap", &domain, &plist.to_string_lossy()])?;
+    run_launchctl(&["kickstart", "-k", &format!("{domain}/{label}")])?;
+    println!("loaded {domain}/{label}");
+    Ok(())
+}
+
+fn unload_launch_agent(label: &str, mode: ActionMode) -> AppResult<()> {
+    if mode == ActionMode::DryRun {
+        println!("dry-run: launchctl bootout gui/<uid>/{label}");
+        return Ok(());
+    }
+
+    let domain = launchd_gui_domain()?;
+    let service = format!("{domain}/{label}");
+    let _ = Command::new("launchctl")
+        .args(["bootout", &service])
+        .output();
+    Ok(())
+}
+
+fn launchd_gui_domain() -> AppResult<String> {
+    let output = run_command_with_timeout("id", &["-u"], Duration::from_secs(1))?;
+    if !output.status.success() {
+        return Err("id -u failed".into());
+    }
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(format!("gui/{uid}"))
+}
+
+fn run_launchctl(arguments: &[&str]) -> AppResult<()> {
+    let output = Command::new("launchctl").args(arguments).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "launchctl {} failed with status {}:\n{}{}",
+        arguments.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .into())
 }
 
 fn load_targets() -> AppResult<Vec<MonitorTarget>> {
@@ -2424,6 +3017,15 @@ fn support_file_path(file_name: &str) -> AppResult<PathBuf> {
 
 fn load_displayplacer() -> AppResult<ParsedDisplayplacer> {
     let output = Command::new("displayplacer").arg("list").output()?;
+    parse_displayplacer_output(output)
+}
+
+fn load_displayplacer_with_timeout(timeout: Duration) -> AppResult<ParsedDisplayplacer> {
+    let output = run_command_with_timeout("displayplacer", &["list"], timeout)?;
+    parse_displayplacer_output(output)
+}
+
+fn parse_displayplacer_output(output: Output) -> AppResult<ParsedDisplayplacer> {
     let raw = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -2435,6 +3037,37 @@ fn load_displayplacer() -> AppResult<ParsedDisplayplacer> {
     }
 
     Ok(parse_displayplacer(&raw))
+}
+
+fn run_command_with_timeout(
+    program: &str,
+    arguments: &[&str],
+    timeout: Duration,
+) -> AppResult<Output> {
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let started = Instant::now();
+
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait_with_output();
+            return Err(format!(
+                "`{} {}` timed out after {}ms",
+                program,
+                arguments.join(" "),
+                timeout.as_millis()
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn parse_displayplacer(raw: &str) -> ParsedDisplayplacer {
@@ -2911,6 +3544,54 @@ displayplacer "id:ABC enabled:true"
         assert_eq!(
             no_enabled_display_safety_action_for_state(&parsed),
             AutoWatchAction::None
+        );
+    }
+
+    #[test]
+    fn guard_stays_idle_when_clamshell_is_closed() {
+        let parsed = parsed_with_displays(Vec::new());
+
+        assert_eq!(
+            internal_guard_action_for_state(ClamshellState::Closed, Some(&parsed)),
+            GuardAction::None
+        );
+    }
+
+    #[test]
+    fn guard_stays_idle_when_internal_is_enabled() {
+        let parsed = parsed_with_displays(vec![internal_display(true)]);
+
+        assert_eq!(
+            internal_guard_action_for_state(ClamshellState::Open, Some(&parsed)),
+            GuardAction::None
+        );
+    }
+
+    #[test]
+    fn guard_preserves_external_only_when_external_is_enabled() {
+        let parsed = parsed_with_displays(vec![external_display(true)]);
+
+        assert_eq!(
+            internal_guard_action_for_state(ClamshellState::Open, Some(&parsed)),
+            GuardAction::None
+        );
+    }
+
+    #[test]
+    fn guard_restores_when_open_and_no_enabled_display_exists() {
+        let parsed = parsed_with_displays(vec![internal_display(false), external_display(false)]);
+
+        assert_eq!(
+            internal_guard_action_for_state(ClamshellState::Open, Some(&parsed)),
+            GuardAction::RestoreInternal
+        );
+    }
+
+    #[test]
+    fn guard_restores_when_open_and_display_state_is_unavailable() {
+        assert_eq!(
+            internal_guard_action_for_state(ClamshellState::Open, None),
+            GuardAction::RestoreInternal
         );
     }
 

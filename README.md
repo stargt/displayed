@@ -84,6 +84,9 @@ cargo run -- restore-display --display-id 2 --dry-run
 cargo run -- redetect-displays --dry-run
 cargo run -- safe-reset --dry-run
 cargo run -- targets
+cargo run -- guard --dry-run
+cargo run -- install-guard --dry-run
+cargo run -- uninstall-guard --dry-run
 cargo run -- watch --dry-run
 cargo run -- watch --target-serial s123456 --interval 60 --dry-run
 ```
@@ -133,6 +136,63 @@ be stale during hot unplug. A remembered internal display disable event is not a
 restore trigger, so auto-disabling the built-in display cannot loop against the
 safety restore. Interactive mode reconciles every 5 seconds; non-interactive
 watch uses the requested interval, defaulting to 60 seconds.
+
+## Internal Display Guard
+
+`displayed guard` is a one-shot safety check. It never disables the internal
+display and never rearranges displays. It only restores the internal display when
+the MacBook lid is open, no enabled internal display is visible, and no enabled
+external display is clearly visible. If the lid is closed, it stays idle so
+normal clamshell use is not disturbed. If display state is unavailable while the
+lid is open, it fails open by restoring the internal display.
+
+```sh
+displayed guard
+```
+
+When interactive `displayed` is open, that same process is the only long-running
+watcher. It already watches CoreGraphics display changes and now also registers
+for macOS system power notifications. On `SystemWillSleep`, it proactively
+restores the internal display before allowing sleep, so an internal-off layout is
+not carried across an eight-hour sleep after the external monitor is unplugged.
+On wake, it runs the restore-only guard before refreshing the TUI state.
+
+```sh
+displayed
+```
+
+For crash/stuck recovery when the interactive process is not running or is not
+responding, install the launchd one-shot guard:
+
+```sh
+displayed install-guard
+```
+
+This writes one user LaunchAgent:
+
+- `~/Library/LaunchAgents/com.stargt.displayed.guard.plist`
+
+It runs `displayed guard --reason launchd --quiet` at load and every 30 seconds.
+It is not a kept-alive monitoring process; each run exits after the one-shot
+check. This still gives recovery coverage if the interactive TUI or `watch`
+exits, crashes, or gets stuck.
+
+This is a plain user LaunchAgent, not a packaged macOS Login Item. It may not
+appear in System Settings -> Login Items & Extensions. Manage it with the
+`install-guard` and `uninstall-guard` commands, or by inspecting
+`~/Library/LaunchAgents/com.stargt.displayed.guard.plist` directly.
+
+Uninstall the launchd guard with:
+
+```sh
+displayed uninstall-guard
+```
+
+The launchd guard path is restore-only, so it preserves the intended auto-target
+behavior: saved external targets may still disable the internal display when they
+are definitely present, but a MacBook opened without a usable external display is
+forced back to an enabled internal display. This cannot cover pre-login/FileVault
+or OS/hardware failures before the user's LaunchAgents are allowed to run.
 
 ## Auto Targets
 
