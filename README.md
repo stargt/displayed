@@ -177,6 +177,13 @@ It is not a kept-alive monitoring process; each run exits after the one-shot
 check. This still gives recovery coverage if the interactive TUI or `watch`
 exits, crashes, or gets stuck.
 
+The plist bakes a `PATH` into `EnvironmentVariables` covering Homebrew
+(`/opt/homebrew/bin`, `/usr/local/bin`), the install-time `PATH`, and standard
+system directories. launchd otherwise runs agents with a minimal `PATH` that omits
+Homebrew, so the guard could not find `displayplacer` and would misread display
+state. Reinstall with `install-guard` after moving `displayplacer` or changing
+shells so the baked-in `PATH` stays correct.
+
 This is a plain user LaunchAgent, not a packaged macOS Login Item. It may not
 appear in System Settings -> Login Items & Extensions. Manage it with the
 `install-guard` and `uninstall-guard` commands, or by inspecting

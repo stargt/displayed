@@ -67,6 +67,7 @@ unsafe extern "C" {
         callback: CGDisplayReconfigurationCallBack,
         user_info: *mut std::ffi::c_void,
     ) -> CGError;
+    fn CGDisplayIsBuiltin(display: CGDirectDisplayID) -> i32;
 }
 
 type CGDisplayReconfigurationCallBack =
@@ -1464,12 +1465,10 @@ fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> App
         println!("guard: reason={reason}");
     }
 
-    if let Err(error) = detect_displays(mode, verbose) {
-        if verbose {
-            eprintln!("warning: display redetection failed: {error}");
-        }
-    }
-
+    // The restore path (restore_internal_once) runs SLSDetectDisplays itself, so the
+    // idle guard stays read-only instead of re-detecting on every run. An
+    // unconditional redetect here resurfaced the intentionally-disabled built-in every
+    // guard interval, which the watcher then re-disabled, causing the built-in to flicker.
     let clamshell = read_clamshell_state(verbose);
     let parsed = load_displayplacer_with_timeout(Duration::from_secs(2));
     let action = match parsed.as_ref() {
@@ -1558,6 +1557,11 @@ fn internal_guard_action_for_state(
         return GuardAction::None;
     }
 
+    // Fail open: when display state is unavailable and the lid is open, restore the
+    // built-in so a dead watcher plus an unplugged external cannot leave the Mac with no
+    // active display. The flicker this once caused came from the guard being blind to a
+    // present external (displayplacer missing from launchd's PATH), now fixed by baking
+    // PATH into the LaunchAgent, so failing open is safe again.
     let Some(parsed) = parsed else {
         return GuardAction::RestoreInternal;
     };
@@ -1735,6 +1739,7 @@ fn install_guard(args: Vec<String>) -> AppResult<()> {
         false,
         &logs_dir.join("displayed-guard.log"),
         &logs_dir.join("displayed-guard.err.log"),
+        &guard_environment_path(),
     );
 
     if mode == ActionMode::DryRun {
@@ -1785,6 +1790,26 @@ fn uninstall_guard(args: Vec<String>) -> AppResult<()> {
     Ok(())
 }
 
+fn guard_environment_path() -> String {
+    // The guard shells out to `displayplacer` (typically under Homebrew). launchd runs
+    // agents with a minimal PATH that omits /opt/homebrew/bin, so bake a usable PATH into
+    // the plist: Homebrew locations, the install-time PATH, then standard system dirs.
+    let mut dirs: Vec<String> = vec!["/opt/homebrew/bin".to_string(), "/usr/local/bin".to_string()];
+    if let Ok(existing) = env::var("PATH") {
+        for dir in existing.split(':').filter(|dir| !dir.is_empty()) {
+            if !dirs.iter().any(|known| known == dir) {
+                dirs.push(dir.to_string());
+            }
+        }
+    }
+    for fallback in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        if !dirs.iter().any(|known| known == fallback) {
+            dirs.push(fallback.to_string());
+        }
+    }
+    dirs.join(":")
+}
+
 fn launch_agent_plist(
     label: &str,
     arguments: &[&str],
@@ -1792,6 +1817,7 @@ fn launch_agent_plist(
     keep_alive: bool,
     stdout_path: &std::path::Path,
     stderr_path: &std::path::Path,
+    path_env: &str,
 ) -> String {
     let mut body = String::new();
     body.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -1804,6 +1830,12 @@ fn launch_agent_plist(
         body.push_str(&format!("    <string>{}</string>\n", xml_escape(argument)));
     }
     body.push_str("  </array>\n");
+    if !path_env.is_empty() {
+        body.push_str("  <key>EnvironmentVariables</key>\n  <dict>\n");
+        body.push_str("    <key>PATH</key>\n");
+        body.push_str(&format!("    <string>{}</string>\n", xml_escape(path_env)));
+        body.push_str("  </dict>\n");
+    }
     body.push_str("  <key>RunAtLoad</key>\n  <true/>\n");
     if keep_alive {
         body.push_str("  <key>KeepAlive</key>\n  <true/>\n");
@@ -2071,7 +2103,11 @@ fn apply_interactive_display_recovery_for_change(
     force: bool,
     verbose: bool,
 ) -> AppResult<AutoWatchAction> {
-    match display_loss_restore_action_for_change(change, remembered_internal_display_id()?) {
+    match display_loss_restore_action_for_change(
+        change,
+        remembered_internal_display_id()?,
+        display_is_builtin(change.display),
+    ) {
         AutoWatchAction::RestoredInternal => {
             restore_internal_safety(mode, verbose)?;
             return Ok(AutoWatchAction::RestoredInternal);
@@ -2178,15 +2214,23 @@ fn load_displayplacer_for_auto_watch(
     }
 }
 
+fn display_is_builtin(display: CGDirectDisplayID) -> bool {
+    unsafe { CGDisplayIsBuiltin(display) != 0 }
+}
+
 fn display_loss_restore_action_for_change(
     change: DisplayChange,
     internal_display_id: Option<CGDirectDisplayID>,
+    change_is_builtin: bool,
 ) -> AutoWatchAction {
     if !change.is_display_loss() {
         return AutoWatchAction::None;
     }
 
-    if internal_display_id == Some(change.display) {
+    // Never treat the built-in's own disable as an external loss. The live
+    // CGDisplayIsBuiltin check covers the case where internal_display_id is a stale
+    // contextual id from an earlier session that no longer matches change.display.
+    if change_is_builtin || internal_display_id == Some(change.display) {
         return AutoWatchAction::None;
     }
 
@@ -2608,8 +2652,10 @@ fn remember_displays(displays: &[Display]) -> AppResult<()> {
         upsert_remembered_display(&mut remembered, display.clone());
     }
 
-    let mut known_display_ids: BTreeSet<CGDirectDisplayID> =
-        remembered_display_ids()?.into_iter().collect();
+    // Rebuild the known-id set from currently remembered displays only. Seeding from the
+    // previous file union let stale CGDirectDisplayIDs (which macOS reassigns on every
+    // reconnect/reboot) accumulate without bound and bloated the restore set.
+    let mut known_display_ids: BTreeSet<CGDirectDisplayID> = BTreeSet::new();
     for display in &remembered {
         if let Some(display_id) = display.contextual_display_id() {
             known_display_ids.insert(display_id);
@@ -3628,7 +3674,7 @@ displayplacer "id:ABC enabled:true"
         };
 
         assert_eq!(
-            display_loss_restore_action_for_change(change, Some(1)),
+            display_loss_restore_action_for_change(change, Some(1), false),
             AutoWatchAction::None
         );
     }
@@ -3641,7 +3687,7 @@ displayplacer "id:ABC enabled:true"
         };
 
         assert_eq!(
-            display_loss_restore_action_for_change(change, Some(1)),
+            display_loss_restore_action_for_change(change, Some(1), false),
             AutoWatchAction::RestoredInternal
         );
     }
@@ -3654,7 +3700,23 @@ displayplacer "id:ABC enabled:true"
         };
 
         assert_eq!(
-            display_loss_restore_action_for_change(change, Some(1)),
+            display_loss_restore_action_for_change(change, Some(1), false),
+            AutoWatchAction::None
+        );
+    }
+
+    #[test]
+    fn display_loss_restore_ignores_builtin_even_when_remembered_id_is_stale() {
+        // Built-in disabled, but the remembered internal_display_id is a stale
+        // contextual id (1) that no longer matches the live id (7). The live builtin
+        // check must still suppress the restore so the watcher does not loop.
+        let change = DisplayChange {
+            display: 7,
+            flags: K_CG_DISPLAY_DISABLED_FLAG,
+        };
+
+        assert_eq!(
+            display_loss_restore_action_for_change(change, Some(1), true),
             AutoWatchAction::None
         );
     }
