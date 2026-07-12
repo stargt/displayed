@@ -22,11 +22,20 @@ use crossterm::{
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 const STATE_FILE_NAME: &str = "state";
 const TARGETS_FILE_NAME: &str = "targets";
+const EVENT_LOG_FILE_NAME: &str = "displayed.log";
 const GUARD_LABEL: &str = "com.stargt.displayed.guard";
 const DEFAULT_WATCH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_INTERACTIVE_RECONCILE_INTERVAL_SECS: u64 = 5;
 const DEFAULT_GUARD_INTERVAL_SECS: u64 = 30;
+const INTERNAL_RESTORE_ATTEMPTS: u32 = 3;
+const INTERNAL_RESTORE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const INTERNAL_RESTORE_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 type CGDirectDisplayID = u32;
+// The built-in panel's contextual id on this machine (Apple Silicon assigns it 1). Used
+// as a last-resort enable target when the disabled built-in has dropped out of the
+// online display list entirely, so neither the live lookup nor the remembered id can
+// name it — empirically the only thing that brings the panel back in that state.
+const FALLBACK_BUILTIN_DISPLAY_ID: CGDirectDisplayID = 1;
 type CGDisplayChangeSummaryFlags = u32;
 type CGDisplayConfigRef = *mut std::ffi::c_void;
 type CGError = i32;
@@ -68,6 +77,12 @@ unsafe extern "C" {
         user_info: *mut std::ffi::c_void,
     ) -> CGError;
     fn CGDisplayIsBuiltin(display: CGDirectDisplayID) -> i32;
+    fn CGDisplayIsActive(display: CGDirectDisplayID) -> i32;
+    fn CGGetOnlineDisplayList(
+        max_displays: u32,
+        online_displays: *mut CGDirectDisplayID,
+        display_count: *mut u32,
+    ) -> CGError;
 }
 
 type CGDisplayReconfigurationCallBack =
@@ -513,6 +528,7 @@ fn interactive_mode() -> AppResult<()> {
     };
     let mut targets = load_targets()?;
     let mut selected = 0usize;
+    let mut show_help = false;
     let mut status = event_status
         .or(power_status)
         .unwrap_or_else(|| "ready".to_string());
@@ -551,91 +567,102 @@ fn interactive_mode() -> AppResult<()> {
                         break;
                     }
 
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            selected = selected.saturating_sub(1);
-                            needs_render = true;
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if let Some(parsed) = parsed.as_ref() {
-                                if selected + 1 < parsed.displays.len() {
-                                    selected += 1;
-                                    needs_render = true;
+                    if show_help {
+                        // Any key dismisses the help screen without triggering its action.
+                        show_help = false;
+                        needs_render = true;
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('?') => {
+                                show_help = true;
+                                needs_render = true;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                selected = selected.saturating_sub(1);
+                                needs_render = true;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if let Some(parsed) = parsed.as_ref() {
+                                    if selected + 1 < parsed.displays.len() {
+                                        selected += 1;
+                                        needs_render = true;
+                                    }
                                 }
                             }
-                        }
-                        KeyCode::Char('r') => {
-                            should_refresh = true;
-                            status = "refreshed".to_string();
-                            needs_render = true;
-                        }
-                        KeyCode::Char('s') => {
-                            match safe_reset_once_with_verbosity(ActionMode::Execute, false) {
-                                Ok(()) => status = "safe reset completed".to_string(),
-                                Err(error) => status = format!("safe reset failed: {error}"),
+                            KeyCode::Char('r') => {
+                                should_refresh = true;
+                                status = "refreshed".to_string();
+                                needs_render = true;
                             }
-                            should_refresh = true;
-                            needs_render = true;
-                        }
-                        KeyCode::Char('i') => {
-                            status = match toggle_internal_for_ui() {
-                                Ok(message) => message,
-                                Err(error) => format!("internal toggle failed: {error}"),
-                            };
-                            should_refresh = true;
-                            needs_render = true;
-                        }
-                        KeyCode::Enter | KeyCode::Char(' ') => {
-                            status = match parsed
-                                .as_ref()
-                                .and_then(|parsed| parsed.displays.get(selected))
-                            {
-                                Some(display) => match toggle_display_for_ui(display) {
+                            KeyCode::Char('s') => {
+                                match safe_reset_once_with_verbosity(ActionMode::Execute, false) {
+                                    Ok(()) => status = "safe reset completed".to_string(),
+                                    Err(error) => status = format!("safe reset failed: {error}"),
+                                }
+                                should_refresh = true;
+                                needs_render = true;
+                            }
+                            KeyCode::Char('i') => {
+                                status = match toggle_internal_for_ui() {
                                     Ok(message) => message,
-                                    Err(error) => format!("display toggle failed: {error}"),
-                                },
-                                None => "no selected display".to_string(),
-                            };
-                            should_refresh = true;
-                            needs_render = true;
-                        }
-                        KeyCode::Char('a') => {
-                            status = match parsed
-                                .as_ref()
-                                .and_then(|parsed| parsed.displays.get(selected))
-                            {
-                                Some(display) => match toggle_target_for_display(display) {
-                                    Ok(true) => {
-                                        "auto target saved for selected external".to_string()
-                                    }
-                                    Ok(false) => {
-                                        "auto target removed for selected external".to_string()
-                                    }
-                                    Err(error) => format!("auto target update failed: {error}"),
-                                },
-                                None => "no selected display".to_string(),
-                            };
-                            targets = load_targets()?;
-                            match apply_interactive_display_recovery(
-                                &targets,
-                                ActionMode::Execute,
-                                false,
-                                false,
-                            ) {
-                                Ok(AutoWatchAction::DisabledInternal) => {
-                                    status = "auto target matched; internal disabled".to_string()
-                                }
-                                Ok(AutoWatchAction::RestoredInternal) => {
-                                    status = "internal restore requested".to_string()
-                                }
-                                Ok(AutoWatchAction::None) => {}
-                                Err(error) => status = format!("auto watch failed: {error}"),
+                                    Err(error) => format!("internal toggle failed: {error}"),
+                                };
+                                should_refresh = true;
+                                needs_render = true;
                             }
-                            should_refresh = true;
-                            needs_render = true;
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                status = match parsed
+                                    .as_ref()
+                                    .and_then(|parsed| parsed.displays.get(selected))
+                                {
+                                    Some(display) => match toggle_display_for_ui(display) {
+                                        Ok(message) => message,
+                                        Err(error) => format!("display toggle failed: {error}"),
+                                    },
+                                    None => "no selected display".to_string(),
+                                };
+                                should_refresh = true;
+                                needs_render = true;
+                            }
+                            KeyCode::Char('a') => {
+                                status = match parsed
+                                    .as_ref()
+                                    .and_then(|parsed| parsed.displays.get(selected))
+                                {
+                                    Some(display) => match toggle_target_for_display(display) {
+                                        Ok(true) => {
+                                            "auto target saved for selected external".to_string()
+                                        }
+                                        Ok(false) => {
+                                            "auto target removed for selected external".to_string()
+                                        }
+                                        Err(error) => format!("auto target update failed: {error}"),
+                                    },
+                                    None => "no selected display".to_string(),
+                                };
+                                targets = load_targets()?;
+                                match apply_interactive_display_recovery(
+                                    &targets,
+                                    ActionMode::Execute,
+                                    false,
+                                    false,
+                                ) {
+                                    Ok(AutoWatchAction::DisabledInternal) => {
+                                        status =
+                                            "auto target matched; internal disabled".to_string()
+                                    }
+                                    Ok(AutoWatchAction::RestoredInternal) => {
+                                        status = "internal restore requested".to_string()
+                                    }
+                                    Ok(AutoWatchAction::None) => {}
+                                    Err(error) => status = format!("auto watch failed: {error}"),
+                                }
+                                should_refresh = true;
+                                needs_render = true;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 Event::Resize(columns, _) => {
@@ -649,6 +676,12 @@ fn interactive_mode() -> AppResult<()> {
         while let Ok(event) = watch_rx.try_recv() {
             match event {
                 WatchEvent::DisplayChanged(change) => {
+                    log_event(&format!(
+                        "display-change: display={} flags={:#x} loss={}",
+                        change.display,
+                        change.flags,
+                        change.is_display_loss()
+                    ));
                     should_refresh = true;
                     match apply_interactive_display_recovery_for_change(
                         &targets,
@@ -695,6 +728,7 @@ fn interactive_mode() -> AppResult<()> {
                 PowerEvent::SystemWillPowerOn => "system-will-power-on",
                 PowerEvent::SystemHasPoweredOn => "system-has-powered-on",
             };
+            log_event(&format!("power: {reason} — running internal guard"));
             should_refresh = true;
             match run_internal_guard_once(reason, ActionMode::Execute, false) {
                 Ok(()) => status = format!("power event reconciled: {reason}"),
@@ -709,10 +743,69 @@ fn interactive_mode() -> AppResult<()> {
         }
 
         if needs_render {
-            render_interactive(parsed.as_ref(), &targets, selected, &status, width)?;
+            if show_help {
+                render_help()?;
+            } else {
+                render_interactive(parsed.as_ref(), &targets, selected, &status, width)?;
+            }
         }
     }
 
+    Ok(())
+}
+
+fn render_help() -> AppResult<()> {
+    let mut out = io::stdout();
+    queue!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+
+    queue!(
+        out,
+        SetAttribute(Attribute::Bold),
+        Print("displayed — help"),
+        SetAttribute(Attribute::Reset),
+        Print("\r\n\r\n")
+    )?;
+
+    for (key, description) in [
+        ("up/down, k/j", "Move the selection between displays."),
+        (
+            "space, enter",
+            "Toggle the selected display: disable it if it is on, enable it if it is off.",
+        ),
+        (
+            "i",
+            "Toggle the built-in (internal) display: disable it when it is on; when it is off or missing, enable it (native restore with redetection if needed).",
+        ),
+        (
+            "a",
+            "Save or remove the selected external display as an auto target. While an auto target is connected, the built-in display is kept disabled automatically; when it disconnects, the built-in is restored.",
+        ),
+        (
+            "s",
+            "Safe reset: redetect displays and re-enable every remembered or detected display. Recovery hammer for when the screen setup looks wrong.",
+        ),
+        ("r", "Refresh the display list."),
+        ("?", "Show this help."),
+        ("q, esc", "Quit."),
+    ] {
+        queue!(
+            out,
+            SetAttribute(Attribute::Bold),
+            Print(format!("  {key:<14}")),
+            SetAttribute(Attribute::Reset),
+            Print(description),
+            Print("\r\n")
+        )?;
+    }
+
+    queue!(
+        out,
+        Print("\r\n"),
+        SetAttribute(Attribute::Dim),
+        Print("press any key to close this help"),
+        SetAttribute(Attribute::Reset)
+    )?;
+    out.flush()?;
     Ok(())
 }
 
@@ -849,7 +942,7 @@ fn render_interactive(
     queue!(
         out,
         Print(
-            "[up/down] select  [space] toggle  [i] internal  [a] auto target  [s] safe reset  [r] refresh  [q] quit\r\n"
+            "[up/down] select  [space] toggle  [i] internal  [a] auto target  [s] safe reset  [r] refresh  [?] help  [q] quit\r\n"
         )
     )?;
     queue!(
@@ -953,11 +1046,23 @@ fn toggle_internal_for_ui() -> AppResult<String> {
             set_displayplacer_enabled(id, true, ActionMode::Execute, false)?;
             Ok("internal enabled".to_string())
         } else {
-            restore_internal_once(None, ActionMode::Execute, false, false)?;
+            restore_internal_once(
+                None,
+                ActionMode::Execute,
+                false,
+                false,
+                INTERNAL_RESTORE_ATTEMPTS,
+            )?;
             Ok("internal restore requested".to_string())
         }
     } else {
-        restore_internal_once(None, ActionMode::Execute, false, false)?;
+        restore_internal_once(
+            None,
+            ActionMode::Execute,
+            false,
+            false,
+            INTERNAL_RESTORE_ATTEMPTS,
+        )?;
         Ok("internal restore requested".to_string())
     }
 }
@@ -1175,7 +1280,13 @@ fn restore_internal(args: Vec<String>) -> AppResult<()> {
         i += 1;
     }
 
-    restore_internal_once(display_id, mode, displayplacer_fallback, true)
+    restore_internal_once(
+        display_id,
+        mode,
+        displayplacer_fallback,
+        true,
+        INTERNAL_RESTORE_ATTEMPTS,
+    )
 }
 
 fn restore_display(args: Vec<String>) -> AppResult<()> {
@@ -1212,26 +1323,10 @@ fn restore_internal_once(
     mode: ActionMode,
     displayplacer_fallback: bool,
     verbose: bool,
+    attempts: u32,
 ) -> AppResult<()> {
     detect_displays(mode, verbose)?;
-
-    let display_id = match display_id {
-        Some(display_id) => Some(display_id),
-        None => read_state_value("internal_display_id")?
-            .map(|value| value.parse())
-            .transpose()?,
-    };
-
-    if let Some(display_id) = display_id {
-        set_native_display_enabled(display_id, true, mode, verbose)?;
-        if mode == ActionMode::Execute {
-            remember_contextual_display_id(display_id)?;
-        }
-    } else if verbose {
-        eprintln!(
-            "warning: no internal display id; ran display redetection only. Try `restore-internal --display-id 1` if the built-in display's contextual/display ID is 1."
-        );
-    }
+    enable_internal_with_retry(display_id, attempts, mode, verbose)?;
 
     if displayplacer_fallback {
         if let Some(id) = read_state_value("internal_id")? {
@@ -1244,6 +1339,98 @@ fn restore_internal_once(
     }
 
     Ok(())
+}
+
+// Candidate ids to enable when bringing the built-in panel back, in trust order. An
+// explicit caller id is authoritative and tried alone. Otherwise: the live online-list
+// lookup (correct whenever the disabled built-in is still enumerable), the remembered
+// contextual id, and finally FALLBACK_BUILTIN_DISPLAY_ID for the observed worst case
+// where the panel is offline and every recorded id has gone stale.
+fn internal_restore_candidates(
+    explicit: Option<CGDirectDisplayID>,
+    live_builtin: Option<CGDirectDisplayID>,
+    remembered: Option<CGDirectDisplayID>,
+) -> Vec<CGDirectDisplayID> {
+    if let Some(explicit) = explicit {
+        return vec![explicit];
+    }
+
+    let mut candidates = Vec::new();
+    for candidate in [live_builtin, remembered, Some(FALLBACK_BUILTIN_DISPLAY_ID)]
+        .into_iter()
+        .flatten()
+    {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+// Natively enable the built-in panel and verify it actually came up, retrying across
+// the wake window. Two failure modes make one shot unreliable: ids are reassigned
+// across deep sleep (a stale id errors with 1001, or worse succeeds as a silent no-op),
+// and right after wake macOS holds the display configuration so even a correct id gets
+// a transient 1001. Re-resolving candidates and verifying with CGDisplayIsActive on
+// every attempt covers both.
+fn enable_internal_with_retry(
+    explicit: Option<CGDirectDisplayID>,
+    attempts: u32,
+    mode: ActionMode,
+    verbose: bool,
+) -> AppResult<()> {
+    if mode == ActionMode::DryRun {
+        let remembered = remembered_internal_display_id()?;
+        let candidates = internal_restore_candidates(explicit, None, remembered);
+        return set_native_display_enabled(candidates[0], true, mode, verbose);
+    }
+
+    let mut last_error: Option<String> = None;
+    for attempt in 1..=attempts.max(1) {
+        if attempt > 1 {
+            thread::sleep(INTERNAL_RESTORE_RETRY_DELAY);
+            let _ = detect_displays(mode, false);
+        }
+
+        if builtin_display_active() {
+            log_event(&format!(
+                "restore-internal: builtin already active (attempt {attempt}/{attempts})"
+            ));
+            return Ok(());
+        }
+
+        let live_builtin = current_builtin_display_id();
+        let remembered = remembered_internal_display_id()?;
+        let candidates = internal_restore_candidates(explicit, live_builtin, remembered);
+        log_event(&format!(
+            "restore-internal: attempt {attempt}/{attempts} candidates {candidates:?} (live={live_builtin:?} remembered={remembered:?})"
+        ));
+
+        for display_id in candidates {
+            match set_native_display_enabled(display_id, true, mode, verbose) {
+                Ok(()) => {
+                    if wait_for_builtin_active(INTERNAL_RESTORE_VERIFY_TIMEOUT) {
+                        log_event(&format!(
+                            "restore-internal: builtin active after enabling id {display_id}"
+                        ));
+                        remember_contextual_display_id(display_id)?;
+                        return Ok(());
+                    }
+                    log_event(&format!(
+                        "restore-internal: id {display_id} enabled ok but builtin not active"
+                    ));
+                    last_error = Some(format!(
+                        "enable of display id {display_id} reported ok but built-in did not become active"
+                    ));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| "internal restore did not enable the built-in display".to_string())
+        .into())
 }
 
 fn restore_display_id(
@@ -1396,6 +1583,14 @@ fn safe_reset_once_with_verbosity(mode: ActionMode, verbose: bool) -> AppResult<
 }
 
 fn restore_internal_safety(mode: ActionMode, verbose: bool) -> AppResult<()> {
+    // With the lid closed the panel cannot light up: every enable fails (err 1014) and
+    // during closed-lid sleep this path used to spam failing CGS transactions for hours,
+    // colliding with macOS's own reconfiguration. The guard restores once the lid opens.
+    if read_clamshell_state(verbose) == ClamshellState::Closed {
+        log_event("internal safety restore: skipped (clamshell closed)");
+        return Ok(());
+    }
+
     if verbose {
         println!("internal safety restore: redetect displays");
     }
@@ -1405,34 +1600,10 @@ fn restore_internal_safety(mode: ActionMode, verbose: bool) -> AppResult<()> {
         }
     }
 
-    let remembered_display_ids = remembered_display_ids()?;
-    if remembered_display_ids.is_empty() {
-        if verbose {
-            eprintln!("warning: no remembered display ids; skipped native restore");
-        }
-        return Ok(());
-    }
-
-    let mut enabled_any = false;
-    let mut last_error: Option<String> = None;
-
-    for display_id in remembered_display_ids {
-        if verbose {
-            println!("internal safety restore: enable remembered display id {display_id}");
-        }
-        match set_native_display_enabled(display_id, true, mode, verbose) {
-            Ok(()) => enabled_any = true,
-            Err(error) => last_error = Some(error.to_string()),
-        }
-    }
-
-    if enabled_any {
-        Ok(())
-    } else {
-        Err(last_error
-            .unwrap_or_else(|| "internal safety restore did not enable any display".to_string())
-            .into())
-    }
+    // Only the built-in panel is restored here. Enabling every remembered contextual id
+    // (as this once did) can silently power an external instead, because macOS reuses
+    // those ids across monitors and deep sleeps.
+    enable_internal_with_retry(None, INTERNAL_RESTORE_ATTEMPTS, mode, verbose)
 }
 
 fn guard(args: Vec<String>) -> AppResult<()> {
@@ -1486,6 +1657,28 @@ fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> App
         }
     };
 
+    let (internal_enabled, external_enabled) = match parsed.as_ref() {
+        Ok(parsed) => (
+            parsed
+                .displays
+                .iter()
+                .any(|display| display.is_internal() && display.is_enabled()),
+            parsed
+                .displays
+                .iter()
+                .any(|display| !display.is_internal() && display.is_enabled()),
+        ),
+        Err(_) => (false, false),
+    };
+    // Skip the boring "internal already on, nothing to do" heartbeat (runs every 30s);
+    // log only the cases that matter for diagnosing a stuck-off built-in.
+    if action == GuardAction::RestoreInternal || parsed.is_err() || !internal_enabled {
+        log_event(&format!(
+            "guard: reason={reason} clamshell={clamshell:?} state={} internal_enabled={internal_enabled} external_enabled={external_enabled} action={action:?}",
+            if parsed.is_ok() { "ok" } else { "unavailable" }
+        ));
+    }
+
     match action {
         GuardAction::None => {
             if verbose {
@@ -1497,13 +1690,13 @@ fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> App
             if verbose {
                 println!("guard: restoring internal display");
             }
-            restore_internal_only_safety(mode, verbose)
+            restore_internal_only_safety(mode, verbose, INTERNAL_RESTORE_ATTEMPTS)
         }
     }
 }
 
-fn restore_internal_only_safety(mode: ActionMode, verbose: bool) -> AppResult<()> {
-    if let Err(error) = restore_internal_once(None, mode, false, verbose) {
+fn restore_internal_only_safety(mode: ActionMode, verbose: bool, attempts: u32) -> AppResult<()> {
+    if let Err(error) = restore_internal_once(None, mode, false, verbose, attempts) {
         if verbose {
             eprintln!("warning: native internal restore failed: {error}");
         }
@@ -1676,7 +1869,11 @@ unsafe extern "C" fn power_event_callback(
         } else {
             ActionMode::Execute
         };
-        let _ = restore_internal_only_safety(mode, false);
+        log_event("power: SystemWillSleep — restoring internal before sleep");
+        // Single attempt only: this callback must hand the power change back promptly
+        // (IOAllowPowerChange below), so it must not sit in the retry/verify loop and
+        // delay sleep. The wake-side guard is the robust recovery path.
+        let _ = restore_internal_only_safety(mode, false, 1);
         if root_port != 0 {
             let _ = unsafe { IOAllowPowerChange(root_port, message_argument as isize) };
         }
@@ -1794,7 +1991,10 @@ fn guard_environment_path() -> String {
     // The guard shells out to `displayplacer` (typically under Homebrew). launchd runs
     // agents with a minimal PATH that omits /opt/homebrew/bin, so bake a usable PATH into
     // the plist: Homebrew locations, the install-time PATH, then standard system dirs.
-    let mut dirs: Vec<String> = vec!["/opt/homebrew/bin".to_string(), "/usr/local/bin".to_string()];
+    let mut dirs: Vec<String> = vec![
+        "/opt/homebrew/bin".to_string(),
+        "/usr/local/bin".to_string(),
+    ];
     if let Ok(existing) = env::var("PATH") {
         for dir in existing.split(':').filter(|dir| !dir.is_empty()) {
             if !dirs.iter().any(|known| known == dir) {
@@ -1880,6 +2080,27 @@ fn home_dir() -> AppResult<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "HOME is not set".into())
+}
+
+// Append a timestamped line to the persistent event log. Best-effort and silent on
+// failure: the interactive TUI runs in raw mode and the launchd guard runs with
+// --quiet, so neither can use stdout/stderr. A file is the only durable trace of what
+// the watcher/guard saw and did across a sleep/wake when nobody is watching the screen.
+fn log_event(message: &str) {
+    let Ok(dir) = logs_dir() else {
+        return;
+    };
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let stamp = unix_timestamp().unwrap_or(0);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(EVENT_LOG_FILE_NAME))
+    {
+        let _ = file.write_all(format!("{stamp} {message}\n").as_bytes());
+    }
 }
 
 fn load_launch_agent(label: &str, plist: &std::path::Path, mode: ActionMode) -> AppResult<()> {
@@ -2216,6 +2437,48 @@ fn load_displayplacer_for_auto_watch(
 
 fn display_is_builtin(display: CGDirectDisplayID) -> bool {
     unsafe { CGDisplayIsBuiltin(display) != 0 }
+}
+
+fn online_display_ids() -> Vec<CGDirectDisplayID> {
+    let mut ids = [0 as CGDirectDisplayID; 32];
+    let mut count: u32 = 0;
+    let status = unsafe { CGGetOnlineDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    if status != 0 {
+        return Vec::new();
+    }
+    ids[..count as usize].to_vec()
+}
+
+// Resolve the built-in display's *current* CGDirectDisplayID from the live online list.
+// macOS reassigns CGDirectDisplayIDs across deep sleep / reconnect, so a remembered
+// contextual id can address the wrong display or none at all, which makes the native
+// enable a silent no-op and leaves the panel dark. The live id is authoritative.
+fn current_builtin_display_id() -> Option<CGDirectDisplayID> {
+    online_display_ids()
+        .into_iter()
+        .find(|&id| display_is_builtin(id))
+}
+
+fn builtin_display_active() -> bool {
+    current_builtin_display_id()
+        .map(|id| unsafe { CGDisplayIsActive(id) != 0 })
+        .unwrap_or(false)
+}
+
+// The enable commits asynchronously: CGCompleteDisplayConfiguration can return 0 before
+// the panel is actually driven (and a stale id "succeeds" without ever driving it), so
+// poll the live state briefly instead of trusting the return code.
+fn wait_for_builtin_active(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if builtin_display_active() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn display_loss_restore_action_for_change(
@@ -2629,14 +2892,23 @@ fn set_native_display_enabled(
         unsafe {
             CGCancelDisplayConfiguration(config);
         }
+        log_event(&format!(
+            "cgs-configure: display_id={display_id} enabled={enabled} configure_err={configure}"
+        ));
         return Err(format!("CGSConfigureDisplayEnabled failed: {configure}").into());
     }
 
     let complete = unsafe { CGCompleteDisplayConfiguration(config, K_CG_CONFIGURE_PERMANENTLY) };
     if complete != 0 {
+        log_event(&format!(
+            "cgs-configure: display_id={display_id} enabled={enabled} complete_err={complete}"
+        ));
         return Err(format!("CGCompleteDisplayConfiguration failed: {complete}").into());
     }
 
+    log_event(&format!(
+        "cgs-configure: display_id={display_id} enabled={enabled} ok"
+    ));
     Ok(())
 }
 
@@ -3382,6 +3654,42 @@ displayplacer "id:ABC enabled:true"
     fn normalizes_serial_prefix() {
         assert_eq!(normalize_id("s123"), normalize_id("123"));
         assert_eq!(normalize_id("SABC"), normalize_id("abc"));
+    }
+
+    #[test]
+    fn internal_restore_candidates_prefers_live_then_remembered_then_fallback() {
+        assert_eq!(
+            internal_restore_candidates(None, Some(5), Some(2)),
+            vec![5, 2, FALLBACK_BUILTIN_DISPLAY_ID]
+        );
+    }
+
+    #[test]
+    fn internal_restore_candidates_dedupes_overlapping_ids() {
+        assert_eq!(
+            internal_restore_candidates(None, Some(1), Some(1)),
+            vec![FALLBACK_BUILTIN_DISPLAY_ID]
+        );
+        assert_eq!(
+            internal_restore_candidates(None, None, Some(2)),
+            vec![2, FALLBACK_BUILTIN_DISPLAY_ID]
+        );
+    }
+
+    #[test]
+    fn internal_restore_candidates_falls_back_to_builtin_id_when_nothing_known() {
+        assert_eq!(
+            internal_restore_candidates(None, None, None),
+            vec![FALLBACK_BUILTIN_DISPLAY_ID]
+        );
+    }
+
+    #[test]
+    fn internal_restore_candidates_uses_explicit_id_alone() {
+        assert_eq!(
+            internal_restore_candidates(Some(7), Some(5), Some(2)),
+            vec![7]
+        );
     }
 
     #[test]

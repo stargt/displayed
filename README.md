@@ -113,6 +113,7 @@ built-in display is currently visible. It uses a keyboard TUI:
 - `a`: save/remove the selected external display as an auto target.
 - `s`: safe reset.
 - `r`: refresh.
+- `?`: show an in-app help screen describing every key.
 - `q`: quit.
 
 Auto targets are stored under
