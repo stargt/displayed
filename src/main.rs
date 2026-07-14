@@ -30,6 +30,7 @@ const DEFAULT_GUARD_INTERVAL_SECS: u64 = 30;
 const INTERNAL_RESTORE_ATTEMPTS: u32 = 3;
 const INTERNAL_RESTORE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const INTERNAL_RESTORE_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
+const BUILTIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 type CGDirectDisplayID = u32;
 // The built-in panel's contextual id on this machine (Apple Silicon assigns it 1). Used
 // as a last-resort enable target when the disabled built-in has dropped out of the
@@ -452,6 +453,12 @@ fn run() -> AppResult<()> {
         "safe-reset" | "reset-safe" => safe_reset(args.collect())?,
         "targets" => targets_command(args.collect())?,
         "guard" => guard(args.collect())?,
+        // Internal-only: fresh-process probe of the built-in panel's live state. The
+        // per-process CoreGraphics snapshot can go stale in long-lived processes (see
+        // builtin_display_active), so callers spawn this instead of trusting their own.
+        "__probe-builtin-active" => {
+            std::process::exit(if builtin_display_active_in_process() { 0 } else { 1 })
+        }
         "install-guard" => install_guard(args.collect())?,
         "uninstall-guard" => uninstall_guard(args.collect())?,
         "watch" => watch(args.collect())?,
@@ -1767,6 +1774,17 @@ fn internal_guard_action_for_state(
         return GuardAction::None;
     }
 
+    // Intentional auto-off keeps the built-in *listed* as disabled (the displayplacer
+    // disable path), so "enabled external + internal missing from enumeration entirely"
+    // is never a legitimate lid-open state: it is the sleep/unplug transition dropping
+    // the panel from the WindowServer online list, possibly with a phantom external
+    // still reported as enabled (incident of 2026-07-14). Restore regardless of
+    // externals in that case; only a listed-but-disabled internal defers to them.
+    let internal_present = parsed.displays.iter().any(Display::is_internal);
+    if !internal_present {
+        return GuardAction::RestoreInternal;
+    }
+
     let external_enabled = parsed
         .displays
         .iter()
@@ -2459,10 +2477,30 @@ fn current_builtin_display_id() -> Option<CGDirectDisplayID> {
         .find(|&id| display_is_builtin(id))
 }
 
-fn builtin_display_active() -> bool {
+fn builtin_display_active_in_process() -> bool {
     current_builtin_display_id()
         .map(|id| unsafe { CGDisplayIsActive(id) != 0 })
         .unwrap_or(false)
+}
+
+// The per-process CoreGraphics display snapshot resynchronizes only when a
+// reconfiguration callback is delivered. An unplug during closed-lid sleep loses that
+// callback, after which a long-lived process (TUI/watcher) keeps reporting the built-in
+// as online+active while it is gone from the real online list — a false positive that
+// vetoed every restore, including the will-sleep one (incident of 2026-07-14). So the
+// answer must come from a freshly spawned probe, whose snapshot is authoritative; the
+// in-process view is only a fallback for when the probe cannot run at all.
+fn builtin_display_active() -> bool {
+    let probe = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.to_str().map(String::from));
+    let Some(probe) = probe else {
+        return builtin_display_active_in_process();
+    };
+    match run_command_with_timeout(&probe, &["__probe-builtin-active"], BUILTIN_PROBE_TIMEOUT) {
+        Ok(output) => output.status.success(),
+        Err(_) => builtin_display_active_in_process(),
+    }
 }
 
 // The enable commits asynchronously: CGCompleteDisplayConfiguration can return 0 before
@@ -3922,12 +3960,26 @@ displayplacer "id:ABC enabled:true"
     }
 
     #[test]
-    fn guard_preserves_external_only_when_external_is_enabled() {
-        let parsed = parsed_with_displays(vec![external_display(true)]);
+    fn guard_preserves_external_only_when_internal_is_listed_disabled() {
+        // Intentional auto-off: the built-in stays enumerated as disabled.
+        let parsed = parsed_with_displays(vec![internal_display(false), external_display(true)]);
 
         assert_eq!(
             internal_guard_action_for_state(ClamshellState::Open, Some(&parsed)),
             GuardAction::None
+        );
+    }
+
+    #[test]
+    fn guard_restores_when_open_and_internal_is_missing_from_enumeration() {
+        // Incident of 2026-07-14: after unplug-during-sleep the built-in vanished from
+        // the online list while a phantom external was still reported as enabled, and
+        // the old "any enabled external" rule suppressed the restore.
+        let parsed = parsed_with_displays(vec![external_display(true)]);
+
+        assert_eq!(
+            internal_guard_action_for_state(ClamshellState::Open, Some(&parsed)),
+            GuardAction::RestoreInternal
         );
     }
 
