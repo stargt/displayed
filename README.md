@@ -141,11 +141,43 @@ watch uses the requested interval, defaulting to 60 seconds.
 ## Internal Display Guard
 
 `displayed guard` is a one-shot safety check. It never disables the internal
-display and never rearranges displays. It only restores the internal display when
-the MacBook lid is open, no enabled internal display is visible, and no enabled
-external display is clearly visible. If the lid is closed, it stays idle so
-normal clamshell use is not disturbed. If display state is unavailable while the
-lid is open, it fails open by restoring the internal display.
+display and never rearranges displays. It restores the internal display only when
+the MacBook lid is open, no external display is present on the desktop, and the
+built-in itself is absent. If the lid is closed, it stays idle so normal clamshell
+use is not disturbed. If it cannot confirm any panel, it fails open by restoring
+the internal display, so a confused or unreadable system still recovers a usable
+screen.
+
+The decision reads the authoritative CoreGraphics **online** display list through
+a freshly spawned probe ("which panels are present on the desktop?"), not
+`displayplacer` enabled flags and not `CGDisplayIsActive`. Each choice is
+deliberate:
+
+- **Fresh probe, not the in-process snapshot.** A long-lived process's cached
+  CoreGraphics view can keep listing a panel that an unplug-during-sleep already
+  dropped, a false positive that once vetoed every restore. A freshly spawned
+  child queries WindowServer anew, so an unplugged panel is gone and a phantom
+  cannot linger.
+- **Online (present), not active (lit).** An external in idle DPMS display-sleep
+  is still online but reports `CGDisplayIsActive = false`; an active-based check
+  would therefore decide "no external" and re-enable the built-in every 30s during
+  idle, fighting the watcher and heating the Mac. Online is true for a connected
+  panel whether lit or display-asleep, and false only when the panel is unplugged
+  or intentionally disabled (the auto-off built-in leaves the list).
+- **Not `displayplacer`.** The decision no longer depends on `displayplacer` being
+  on the guard's `PATH`, whose absence once made the guard restore every 30s and
+  fight the watcher into a flicker.
+
+Because "is a panel present?" is answered directly and freshly, an intentional
+auto-off / idle display-sleep (a real panel present) and a black-screen emergency
+(no usable display) can no longer be confused for each other — the ambiguity that
+let those two failures alternate across earlier fixes.
+
+The long-running watcher's restore path shares this signal: it will not restore
+the built-in while an external is present on the desktop, so a display-asleep
+external no longer makes the watcher spin failing enables against the
+intentionally-disabled built-in during idle. A genuine unplug still removes the
+external from the online list, so the built-in is restored as before.
 
 ```sh
 displayed guard

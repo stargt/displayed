@@ -459,6 +459,13 @@ fn run() -> AppResult<()> {
         "__probe-builtin-active" => {
             std::process::exit(if builtin_display_active_in_process() { 0 } else { 1 })
         }
+        // Internal-only: fresh-process probe classifying the online display list into
+        // external_present / builtin_present, reported on stdout with exit 0. Same
+        // stale-snapshot rationale as __probe-builtin-active (see display_presence).
+        "__probe-display-presence" => {
+            let (external, builtin) = classify_online_presence();
+            println!("external={} builtin={}", external as u8, builtin as u8);
+        }
         "install-guard" => install_guard(args.collect())?,
         "uninstall-guard" => uninstall_guard(args.collect())?,
         "watch" => watch(args.collect())?,
@@ -1589,12 +1596,58 @@ fn safe_reset_once_with_verbosity(mode: ActionMode, verbose: bool) -> AppResult<
     Ok(())
 }
 
+// True when a saved auto-target is physically connected right now: matched by stable identity
+// and IGNORING displayplacer's enabled flag. A display-asleep (DPMS) external is listed as
+// enabled:false but still connected, so ignoring the flag keeps it counted; matches_display
+// already excludes the built-in and every non-target panel. This is the precise "the reason
+// the built-in was auto-off is still present" signal, symmetric with the auto-off trigger.
+// Unlike a bare "any non-builtin online" count, it excludes virtual / dummy / KVM panels that
+// were never a saved target, so a genuine unplug of the real monitor still restores the
+// built-in even if some other non-builtin panel lingers online (round-2 review, I6).
+fn any_target_connected(parsed: &ParsedDisplayplacer, targets: &[MonitorTarget]) -> bool {
+    parsed
+        .displays
+        .iter()
+        .any(|display| targets.iter().any(|target| target.matches_display(display)))
+}
+
+// Resolve "is a saved auto-target connected?" from fresh reads of the targets file and
+// displayplacer. Any read failure (or no saved targets) returns false, so an unreadable or
+// confused system fails toward restore rather than suppressing a needed one.
+fn saved_target_connected() -> bool {
+    match load_targets() {
+        Ok(targets) if !targets.is_empty() => {
+            match load_displayplacer_with_timeout(Duration::from_secs(2)) {
+                Ok(parsed) => any_target_connected(&parsed, &targets),
+                Err(_) => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn restore_internal_safety(mode: ActionMode, verbose: bool) -> AppResult<()> {
     // With the lid closed the panel cannot light up: every enable fails (err 1014) and
     // during closed-lid sleep this path used to spam failing CGS transactions for hours,
     // colliding with macOS's own reconfiguration. The guard restores once the lid opens.
     if read_clamshell_state(verbose) == ClamshellState::Closed {
         log_event("internal safety restore: skipped (clamshell closed)");
+        return Ok(());
+    }
+
+    // A saved auto-target still connected (online, even in idle DPMS display-sleep where
+    // displayplacer reports it enabled:false) means the built-in is legitimately auto-off, not
+    // a no-display emergency. Skipping restore here stops this path spinning failing CGS
+    // enables (err 1014) against the disabled built-in every reconcile during idle — the real
+    // idle-heat source. Scoped to saved targets by identity, so a virtual/dummy/KVM panel left
+    // online after the real monitor unplugs does NOT block the restore, and a genuine unplug
+    // still recovers the built-in. Logged only in verbose mode to keep this steady state out
+    // of the persistent log. Distinct from the clamshell check: covers lid-open idle with the
+    // target attached.
+    if saved_target_connected() {
+        if verbose {
+            println!("internal safety restore: skipped (saved target connected)");
+        }
         return Ok(());
     }
 
@@ -1643,45 +1696,54 @@ fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> App
         println!("guard: reason={reason}");
     }
 
-    // The restore path (restore_internal_once) runs SLSDetectDisplays itself, so the
-    // idle guard stays read-only instead of re-detecting on every run. An
-    // unconditional redetect here resurfaced the intentionally-disabled built-in every
-    // guard interval, which the watcher then re-disabled, causing the built-in to flicker.
     let clamshell = read_clamshell_state(verbose);
-    let parsed = load_displayplacer_with_timeout(Duration::from_secs(2));
-    let action = match parsed.as_ref() {
-        Ok(parsed) => {
-            if mode == ActionMode::Execute {
-                remember_internal(parsed);
-            }
-            internal_guard_action_for_state(clamshell, Some(parsed))
-        }
-        Err(error) => {
-            if verbose {
-                eprintln!("warning: guard display state unavailable: {error}");
-            }
-            internal_guard_action_for_state(clamshell, None)
-        }
-    };
 
-    let (internal_enabled, external_enabled) = match parsed.as_ref() {
-        Ok(parsed) => (
-            parsed
-                .displays
-                .iter()
-                .any(|display| display.is_internal() && display.is_enabled()),
-            parsed
-                .displays
-                .iter()
-                .any(|display| !display.is_internal() && display.is_enabled()),
-        ),
-        Err(_) => (false, false),
-    };
-    // Skip the boring "internal already on, nothing to do" heartbeat (runs every 30s);
-    // log only the cases that matter for diagnosing a stuck-off built-in.
-    if action == GuardAction::RestoreInternal || parsed.is_err() || !internal_enabled {
+    // Load displayplacer once (freshly, so it is phantom-safe): it refreshes the remembered
+    // built-in id, enriches the log, AND provides the stable-identity match for "is a saved
+    // auto-target still connected?".
+    let parsed = load_displayplacer_with_timeout(Duration::from_secs(2));
+
+    // The decision asks two authoritative questions, neither of which is displayplacer's
+    // enabled flag:
+    //   * external_present = a SAVED auto-target is physically connected (identity match,
+    //     ignoring the DPMS enabled:false state). Scoped to saved targets so a virtual / dummy
+    //     / KVM panel left online after the real monitor unplugs cannot veto the restore
+    //     (round-2 review, I6), while a display-asleep real target still counts (no idle-heat).
+    //     A displayplacer/targets read failure reports absent -> fail toward restore.
+    //   * builtin_present = the built-in is enabled/online, from a fresh CoreGraphics probe.
+    //     CG online (not CGDisplayIsActive, and not displayplacer) reliably lists an
+    //     enabled-but-display-asleep built-in, so we neither wake it needlessly during laptop
+    //     idle nor confuse it with the auto-off (disabled) built-in, which leaves the list.
+    // A fresh probe/process is used throughout so a stale in-process snapshot cannot veto a
+    // restore (incident of 2026-07-14), and so an intentional auto-off / idle display-sleep (a
+    // real panel present) can never be confused with a black-screen emergency (no usable
+    // display) — the ambiguity that let this pair of failures oscillate across past fixes.
+    let targets = load_targets().unwrap_or_default();
+    let external_present = parsed
+        .as_ref()
+        .map(|p| any_target_connected(p, &targets))
+        .unwrap_or(false);
+    let (cg_external_online, builtin_present) = display_presence();
+    let action = internal_guard_action_for_state(clamshell, external_present, builtin_present);
+
+    if let Ok(parsed) = parsed.as_ref() {
+        if mode == ActionMode::Execute {
+            remember_internal(parsed);
+        }
+    } else if verbose {
+        if let Err(error) = parsed.as_ref() {
+            eprintln!("warning: guard displayplacer state unavailable: {error}");
+        }
+    }
+
+    // Log the actionable cases only: every restore (the signal for diagnosing a stuck-off
+    // built-in) and any displayplacer read failure. A healthy auto-off (target connected,
+    // built-in off) is the steady state and must not spam the log every 30s. cg_external_online
+    // is logged as a cross-check: online-but-not-a-saved-target means a virtual/dummy/other
+    // panel the guard is correctly ignoring.
+    if action == GuardAction::RestoreInternal || parsed.is_err() {
         log_event(&format!(
-            "guard: reason={reason} clamshell={clamshell:?} state={} internal_enabled={internal_enabled} external_enabled={external_enabled} action={action:?}",
+            "guard: reason={reason} clamshell={clamshell:?} target_connected={external_present} cg_external_online={cg_external_online} builtin_present={builtin_present} displayplacer={} action={action:?}",
             if parsed.is_ok() { "ok" } else { "unavailable" }
         ));
     }
@@ -1749,50 +1811,41 @@ fn restore_internal_only_safety(mode: ActionMode, verbose: bool, attempts: u32) 
     Ok(())
 }
 
+// The guard is a restore-only safety net with one job: never let the lid-open Mac sit with
+// no usable display, and never fight a legitimately-off built-in. Both reduce to: does the Mac
+// still have a usable panel the user can see?
+//
+//   * clamshell closed        -> None. Closed-lid clamshell/sleep use must not be disturbed.
+//   * a saved target is present -> None. The reason the built-in went auto-off is still
+//                                connected (lit, or merely in idle DPMS display-sleep), so the
+//                                off built-in is legitimate. Deferring here is what stops the
+//                                guard oscillating against the watcher's auto-off (the flicker)
+//                                and from waking displays during idle.
+//   * the built-in is present   -> None. It is enabled (possibly display-asleep); nothing to
+//                                restore, and re-enabling it would needlessly wake it.
+//   * otherwise (lid open, no saved target connected, built-in absent/disabled) ->
+//     RestoreInternal. The true black-screen case, and the fail-open case: a probe that cannot
+//     confirm a panel reports it absent, so an unreadable or confused system still recovers the
+//     built-in instead of stranding the user.
+//
+// `external_present` is "a SAVED auto-target is connected" (stable-identity match against a
+// fresh displayplacer read, ignoring the DPMS enabled flag) — NOT a bare "any non-builtin
+// panel is online" count, so a virtual / dummy / KVM display left online after the real
+// monitor unplugs cannot suppress the restore (round-2 review, I6). `builtin_present` is a
+// fresh CoreGraphics online check (true for an enabled-but-display-asleep built-in, false for
+// the auto-off built-in that has left the online list). Both are resolved by fresh reads in
+// the caller so a stale in-process snapshot cannot veto a restore (incident of 2026-07-14).
 fn internal_guard_action_for_state(
     clamshell: ClamshellState,
-    parsed: Option<&ParsedDisplayplacer>,
+    external_present: bool,
+    builtin_present: bool,
 ) -> GuardAction {
     if clamshell == ClamshellState::Closed {
         return GuardAction::None;
     }
-
-    // Fail open: when display state is unavailable and the lid is open, restore the
-    // built-in so a dead watcher plus an unplugged external cannot leave the Mac with no
-    // active display. The flicker this once caused came from the guard being blind to a
-    // present external (displayplacer missing from launchd's PATH), now fixed by baking
-    // PATH into the LaunchAgent, so failing open is safe again.
-    let Some(parsed) = parsed else {
-        return GuardAction::RestoreInternal;
-    };
-
-    let internal_enabled = parsed
-        .displays
-        .iter()
-        .any(|display| display.is_internal() && display.is_enabled());
-    if internal_enabled {
+    if external_present || builtin_present {
         return GuardAction::None;
     }
-
-    // Intentional auto-off keeps the built-in *listed* as disabled (the displayplacer
-    // disable path), so "enabled external + internal missing from enumeration entirely"
-    // is never a legitimate lid-open state: it is the sleep/unplug transition dropping
-    // the panel from the WindowServer online list, possibly with a phantom external
-    // still reported as enabled (incident of 2026-07-14). Restore regardless of
-    // externals in that case; only a listed-but-disabled internal defers to them.
-    let internal_present = parsed.displays.iter().any(Display::is_internal);
-    if !internal_present {
-        return GuardAction::RestoreInternal;
-    }
-
-    let external_enabled = parsed
-        .displays
-        .iter()
-        .any(|display| !display.is_internal() && display.is_enabled());
-    if external_enabled {
-        return GuardAction::None;
-    }
-
     GuardAction::RestoreInternal
 }
 
@@ -2488,18 +2541,72 @@ fn builtin_display_active_in_process() -> bool {
 // callback, after which a long-lived process (TUI/watcher) keeps reporting the built-in
 // as online+active while it is gone from the real online list — a false positive that
 // vetoed every restore, including the will-sleep one (incident of 2026-07-14). So the
-// answer must come from a freshly spawned probe, whose snapshot is authoritative; the
-// in-process view is only a fallback for when the probe cannot run at all.
+// answer must come from a freshly spawned probe, whose snapshot is authoritative.
+//
+// When the probe cannot run at all (current_exe unknown, spawn failure, or the 2s timeout)
+// we must NOT fall back to this process's own snapshot: this function is also called from
+// the long-lived watcher on wake (run_internal_guard_once), where that snapshot is exactly
+// the stale one above, and a stale "active" would suppress a needed restore and strand the
+// user on a black screen. So a probe that cannot confirm the built-in is lit reports it as
+// dark (false) — the fail-toward-restore direction (I1/I5). The cost is at most one extra
+// idempotent restore attempt; the restore path is a no-op when the panel is truly already
+// lit. STABILITY > CORRECTNESS.
 fn builtin_display_active() -> bool {
     let probe = env::current_exe()
         .ok()
         .and_then(|exe| exe.to_str().map(String::from));
     let Some(probe) = probe else {
-        return builtin_display_active_in_process();
+        return false;
     };
     match run_command_with_timeout(&probe, &["__probe-builtin-active"], BUILTIN_PROBE_TIMEOUT) {
         Ok(output) => output.status.success(),
-        Err(_) => builtin_display_active_in_process(),
+        Err(_) => false,
+    }
+}
+
+// Classify the fresh online display list into (external_present, builtin_present). "Online"
+// is WindowServer's current desktop membership, so a display-asleep panel still counts (idle
+// DPMS does not drop it) while an unplugged or disabled panel does not.
+fn classify_online_presence() -> (bool, bool) {
+    let mut external = false;
+    let mut builtin = false;
+    for id in online_display_ids() {
+        if display_is_builtin(id) {
+            builtin = true;
+        } else {
+            external = true;
+        }
+    }
+    (external, builtin)
+}
+
+// (external_present, builtin_present) from a freshly spawned probe of the CoreGraphics online
+// list. A fresh process is mandatory: a long-lived caller's per-process snapshot can keep
+// listing a panel that an unplug-during-sleep already dropped, a false positive that once
+// vetoed every restore (incident of 2026-07-14). run_internal_guard_once and
+// restore_internal_safety are both called from the long-lived watcher, so they must not
+// trust their own snapshot.
+//
+// The child reports presence on stdout and exits 0. We treat ANYTHING other than a clean,
+// parsed success as "both panels absent" — spawn failure, timeout, non-zero exit, or garbage
+// output all fail toward restore, so an unreadable or confused system recovers the built-in
+// rather than trusting a possibly-stale in-process view (I1/I5). The cost is at most one
+// idempotent restore-then-disable flash if a panel is in fact present when the probe fails
+// (rare, self-correcting); a false "present" would strand the user on a black screen or spin
+// failing restores during idle. STABILITY > CORRECTNESS.
+fn display_presence() -> (bool, bool) {
+    let probe = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.to_str().map(String::from));
+    let Some(probe) = probe else {
+        return (false, false);
+    };
+    match run_command_with_timeout(&probe, &["__probe-display-presence"], BUILTIN_PROBE_TIMEOUT) {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            (text.contains("external=1"), text.contains("builtin=1"))
+        }
+        _ => (false, false),
     }
 }
 
@@ -2670,6 +2777,11 @@ fn watch(args: Vec<String>) -> AppResult<()> {
                         Err(error) => eprintln!("watch iteration failed: {error}"),
                     }
                 } else {
+                    // Reload targets every reconcile so a mid-run `targets` edit is picked up
+                    // without a restart. The launchd guard reads targets fresh each run; if the
+                    // watcher kept a stale snapshot the two could disagree about whether the
+                    // built-in should be off and push it on/off against each other.
+                    let saved_targets = load_targets().unwrap_or_default();
                     match apply_watch_targets(&saved_targets, mode, force, true) {
                         Ok(AutoWatchAction::DisabledInternal) => {
                             println!("watch matched saved target; internal disabled")
@@ -3941,64 +4053,95 @@ displayplacer "id:ABC enabled:true"
 
     #[test]
     fn guard_stays_idle_when_clamshell_is_closed() {
-        let parsed = parsed_with_displays(Vec::new());
-
+        // Closed lid short-circuits regardless of display state, so closed-lid clamshell
+        // use is never disturbed.
         assert_eq!(
-            internal_guard_action_for_state(ClamshellState::Closed, Some(&parsed)),
+            internal_guard_action_for_state(ClamshellState::Closed, false, false),
             GuardAction::None
         );
     }
 
     #[test]
-    fn guard_stays_idle_when_internal_is_enabled() {
-        let parsed = parsed_with_displays(vec![internal_display(true)]);
-
+    fn guard_stays_idle_when_builtin_is_present() {
+        // Built-in enabled (online), no external. Nothing to restore; re-enabling would only
+        // wake it needlessly.
         assert_eq!(
-            internal_guard_action_for_state(ClamshellState::Open, Some(&parsed)),
+            internal_guard_action_for_state(ClamshellState::Open, false, true),
             GuardAction::None
         );
     }
 
     #[test]
-    fn guard_preserves_external_only_when_internal_is_listed_disabled() {
-        // Intentional auto-off: the built-in stays enumerated as disabled.
-        let parsed = parsed_with_displays(vec![internal_display(false), external_display(true)]);
-
+    fn guard_defers_to_a_connected_external_even_if_display_asleep() {
+        // Intentional auto-off steady state: a real external is present (online) and the
+        // built-in is off. The guard must not restore, or it fights the watcher's auto-off
+        // into a ~30s on/off flicker. Crucially `external_present` is ONLINE, not ACTIVE:
+        // an external in idle DPMS display-sleep is online but reports CGDisplayIsActive=false,
+        // and an active-based check would wrongly restore here every 30s during idle,
+        // re-fighting the watcher and heating the Mac. Online keeps this a stand-down.
         assert_eq!(
-            internal_guard_action_for_state(ClamshellState::Open, Some(&parsed)),
+            internal_guard_action_for_state(ClamshellState::Open, true, false),
             GuardAction::None
         );
     }
 
     #[test]
-    fn guard_restores_when_open_and_internal_is_missing_from_enumeration() {
-        // Incident of 2026-07-14: after unplug-during-sleep the built-in vanished from
-        // the online list while a phantom external was still reported as enabled, and
-        // the old "any enabled external" rule suppressed the restore.
-        let parsed = parsed_with_displays(vec![external_display(true)]);
-
+    fn guard_stays_idle_when_both_panels_are_present() {
+        // Monitor-B style "both on": external present and built-in present.
         assert_eq!(
-            internal_guard_action_for_state(ClamshellState::Open, Some(&parsed)),
+            internal_guard_action_for_state(ClamshellState::Open, true, true),
+            GuardAction::None
+        );
+    }
+
+    #[test]
+    fn guard_restores_when_open_with_no_panel_present() {
+        // The true black-screen case: lid open, no saved target connected, built-in absent (the
+        // auto-off/disabled built-in leaves the online list). This one branch also covers
+        // two older concerns by construction:
+        //   * 2026-07-14 phantom external — a fresh probe reports the unplugged external as
+        //     gone, so `external_present` is false and the restore still fires.
+        //   * fail-open — a read that cannot confirm a panel reports both absent (false), so
+        //     an unreadable/confused system recovers the built-in rather than stranding.
+        assert_eq!(
+            internal_guard_action_for_state(ClamshellState::Open, false, false),
             GuardAction::RestoreInternal
         );
     }
 
     #[test]
-    fn guard_restores_when_open_and_no_enabled_display_exists() {
+    fn target_connected_matches_saved_target_even_when_display_asleep() {
+        // Idle DPMS: displayplacer lists the saved external as enabled:false, but identity
+        // still matches, so it counts as connected -> guard/watcher stand down, no idle churn.
+        let target = MonitorTarget::from_display(&external_display(true)).expect("stable target");
         let parsed = parsed_with_displays(vec![internal_display(false), external_display(false)]);
-
-        assert_eq!(
-            internal_guard_action_for_state(ClamshellState::Open, Some(&parsed)),
-            GuardAction::RestoreInternal
-        );
+        assert!(any_target_connected(&parsed, &[target]));
     }
 
     #[test]
-    fn guard_restores_when_open_and_display_state_is_unavailable() {
-        assert_eq!(
-            internal_guard_action_for_state(ClamshellState::Open, None),
-            GuardAction::RestoreInternal
-        );
+    fn target_connected_ignores_non_target_online_external() {
+        // The round-2 catastrophe: the real saved monitor is unplugged, but a virtual / dummy /
+        // KVM panel with a DIFFERENT identity lingers online. It must NOT count as the target,
+        // so the built-in restore is not permanently vetoed (I6).
+        let target = MonitorTarget::from_display(&external_display(true)).expect("stable target");
+        let lingering = Display {
+            persistent_id: Some("VIRTUAL-DUMMY".to_string()),
+            contextual_id: Some("9".to_string()),
+            serial_id: Some("s999999".to_string()),
+            display_type: Some("virtual screen".to_string()),
+            enabled: Some(true),
+            ..Display::default()
+        };
+        let parsed = parsed_with_displays(vec![internal_display(false), lingering]);
+        assert!(!any_target_connected(&parsed, &[target]));
+    }
+
+    #[test]
+    fn target_connected_false_when_target_absent() {
+        // Genuine unplug, nothing else non-builtin online -> not connected -> restore proceeds.
+        let target = MonitorTarget::from_display(&external_display(true)).expect("stable target");
+        let parsed = parsed_with_displays(vec![internal_display(true)]);
+        assert!(!any_target_connected(&parsed, &[target]));
     }
 
     #[test]
