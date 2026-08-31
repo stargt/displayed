@@ -156,8 +156,10 @@ deliberate:
 - **Fresh probe, not the in-process snapshot.** A long-lived process's cached
   CoreGraphics view can keep listing a panel that an unplug-during-sleep already
   dropped, a false positive that once vetoed every restore. A freshly spawned
-  child queries WindowServer anew, so an unplugged panel is gone and a phantom
-  cannot linger.
+  child queries WindowServer anew, which avoids that per-process cache. WindowServer
+  itself can still retain a pre-sleep phantom until another hotplug; the lid-wake
+  recovery described below handles that narrower case without changing periodic
+  idle behavior.
 - **Online (present), not active (lit).** An external in idle DPMS display-sleep
   is still online but reports `CGDisplayIsActive = false`; an active-based check
   would therefore decide "no external" and re-enable the built-in every 30s during
@@ -168,10 +170,10 @@ deliberate:
   on the guard's `PATH`, whose absence once made the guard restore every 30s and
   fight the watcher into a flicker.
 
-Because "is a panel present?" is answered directly and freshly, an intentional
-auto-off / idle display-sleep (a real panel present) and a black-screen emergency
-(no usable display) can no longer be confused for each other — the ambiguity that
-let those two failures alternate across earlier fixes.
+For periodic reconciliation, "is a panel present?" is answered directly and
+freshly so intentional auto-off / idle display-sleep does not cause repeated
+restore attempts. Lid wake has a stricter one-shot active-panel check because a
+pre-sleep phantom can otherwise make an unusable layout look present.
 
 The long-running watcher's restore path shares this signal: it will not restore
 the built-in while an external is present on the desktop, so a display-asleep
@@ -185,10 +187,22 @@ displayed guard
 
 When interactive `displayed` is open, that same process is the only long-running
 watcher. It already watches CoreGraphics display changes and now also registers
-for macOS system power notifications. On `SystemWillSleep`, it proactively
-restores the internal display before allowing sleep, so an internal-off layout is
-not carried across an eight-hour sleep after the external monitor is unplugged.
-On wake, it runs the restore-only guard before refreshing the TUI state.
+for macOS system power notifications. On `SystemWillSleep`, it records a pending
+wake restore under `~/Library/Application Support/displayed/` and acknowledges
+sleep immediately. It does not run a synchronous private display transaction in
+the sleep callback because lid-close can block that transaction for about ten
+seconds and still reject it.
+
+After `SystemHasPoweredOn`, a real lid wake gets a short grace period for the
+built-in panel to become active. If it remains inactive, `displayed` restores it
+even when the previous saved external is still reported as present; that stale
+report can survive deep sleep until another hotplug. Normal non-lid wake and the
+periodic guard keep the online-presence policy above, so an external in ordinary
+DPMS sleep does not cause repeated internal-display flicker. The pending marker is
+cleared only after an active built-in is verified. A separate post-wake hold keeps
+the auto watcher from immediately undoing that recovery based on the same dark
+external phantom; the hold is released when the saved target is observed active or
+absent.
 
 ```sh
 displayed
@@ -201,6 +215,11 @@ responding, install the launchd one-shot guard:
 displayed install-guard
 ```
 
+This is optional and is never installed automatically. If `displayed` is always
+kept running from a terminal, the terminal process already provides the primary
+watcher and power notifications; install the guard only if the extra crash/stuck
+fallback is wanted.
+
 This writes one user LaunchAgent:
 
 - `~/Library/LaunchAgents/com.stargt.displayed.guard.plist`
@@ -208,7 +227,8 @@ This writes one user LaunchAgent:
 It runs `displayed guard --reason launchd --quiet` at load and every 30 seconds.
 It is not a kept-alive monitoring process; each run exits after the one-shot
 check. This still gives recovery coverage if the interactive TUI or `watch`
-exits, crashes, or gets stuck.
+exits, crashes, or gets stuck. If a pending wake marker remains after a crash,
+the first lid-open guard run follows the same active-panel recovery path.
 
 The plist bakes a `PATH` into `EnvironmentVariables` covering Homebrew
 (`/opt/homebrew/bin`, `/usr/local/bin`), the install-time `PATH`, and standard

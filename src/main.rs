@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,6 +23,8 @@ type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 const STATE_FILE_NAME: &str = "state";
 const TARGETS_FILE_NAME: &str = "targets";
 const EVENT_LOG_FILE_NAME: &str = "displayed.log";
+const PENDING_WAKE_RESTORE_FILE_NAME: &str = "pending-wake-restore";
+const WAKE_AUTO_DISABLE_HOLD_FILE_NAME: &str = "wake-auto-disable-hold";
 const GUARD_LABEL: &str = "com.stargt.displayed.guard";
 const DEFAULT_WATCH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_INTERACTIVE_RECONCILE_INTERVAL_SECS: u64 = 5;
@@ -31,6 +33,8 @@ const INTERNAL_RESTORE_ATTEMPTS: u32 = 3;
 const INTERNAL_RESTORE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const INTERNAL_RESTORE_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
 const BUILTIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const WAKE_BUILTIN_GRACE_PERIOD: Duration = Duration::from_secs(2);
+const SLEEP_CLAMSHELL_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 type CGDirectDisplayID = u32;
 // The built-in panel's contextual id on this machine (Apple Silicon assigns it 1). Used
 // as a last-resort enable target when the disabled built-in has dropped out of the
@@ -57,7 +61,6 @@ const K_IO_MESSAGE_SYSTEM_WILL_SLEEP: Natural = 0xe0000280;
 const K_IO_MESSAGE_SYSTEM_WILL_POWER_ON: Natural = 0xe0000320;
 const K_IO_MESSAGE_SYSTEM_HAS_POWERED_ON: Natural = 0xe0000300;
 static POWER_ROOT_PORT: AtomicU32 = AtomicU32::new(0);
-static POWER_DRY_RUN: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -344,6 +347,11 @@ enum GuardAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingWakeRestore {
+    sleep_clamshell: ClamshellState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DisplayChange {
     display: CGDirectDisplayID,
     flags: CGDisplayChangeSummaryFlags,
@@ -456,8 +464,27 @@ fn run() -> AppResult<()> {
         // Internal-only: fresh-process probe of the built-in panel's live state. The
         // per-process CoreGraphics snapshot can go stale in long-lived processes (see
         // builtin_display_active), so callers spawn this instead of trusting their own.
-        "__probe-builtin-active" => {
-            std::process::exit(if builtin_display_active_in_process() { 0 } else { 1 })
+        "__probe-builtin-active" => std::process::exit(if builtin_display_active_in_process() {
+            0
+        } else {
+            1
+        }),
+        // Internal-only: query one contextual display id from a fresh process. Used only
+        // while a post-wake safety hold exists, so a stale enabled target cannot immediately
+        // switch the recovered built-in panel off again.
+        "__probe-display-active" => {
+            let display_id = args
+                .next()
+                .ok_or("__probe-display-active requires a display id")?
+                .parse::<CGDirectDisplayID>()?;
+            if args.next().is_some() {
+                return Err("__probe-display-active accepts exactly one display id".into());
+            }
+            std::process::exit(if display_active_in_process(display_id) {
+                0
+            } else {
+                1
+            });
         }
         // Internal-only: fresh-process probe classifying the online display list into
         // external_present / builtin_present, reported on stdout with exit 0. Same
@@ -528,7 +555,6 @@ fn interactive_mode() -> AppResult<()> {
     let _terminal = TerminalGuard::enter()?;
     let (watch_rx, _display_events, event_status) =
         start_display_event_source(DEFAULT_INTERACTIVE_RECONCILE_INTERVAL_SECS);
-    POWER_DRY_RUN.store(false, Ordering::SeqCst);
     let (power_rx, _power_events, power_status) = match start_power_event_source() {
         Ok((rx, registration)) => (rx, Some(registration), None),
         Err(error) => {
@@ -738,15 +764,19 @@ fn interactive_mode() -> AppResult<()> {
         }
 
         while let Ok(event) = power_rx.try_recv() {
-            let reason = match event {
-                PowerEvent::SystemWillPowerOn => "system-will-power-on",
-                PowerEvent::SystemHasPoweredOn => "system-has-powered-on",
-            };
-            log_event(&format!("power: {reason} — running internal guard"));
             should_refresh = true;
-            match run_internal_guard_once(reason, ActionMode::Execute, false) {
-                Ok(()) => status = format!("power event reconciled: {reason}"),
-                Err(error) => status = format!("power event recovery failed: {error}"),
+            match event {
+                PowerEvent::SystemWillPowerOn => {
+                    log_event("power: system-will-power-on — waiting for powered-on state");
+                    status = "power event: system-will-power-on".to_string();
+                }
+                PowerEvent::SystemHasPoweredOn => {
+                    let reason = "system-has-powered-on";
+                    match run_wake_recovery_once(reason, ActionMode::Execute, false) {
+                        Ok(()) => status = format!("power event reconciled: {reason}"),
+                        Err(error) => status = format!("power event recovery failed: {error}"),
+                    }
+                }
             }
             needs_render = true;
         }
@@ -1688,7 +1718,11 @@ fn guard(args: Vec<String>) -> AppResult<()> {
         i += 1;
     }
 
-    run_internal_guard_once(&reason, mode, verbose)
+    if pending_wake_restore()?.is_some() {
+        run_wake_recovery_once(&reason, mode, verbose)
+    } else {
+        run_internal_guard_once(&reason, mode, verbose)
+    }
 }
 
 fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> AppResult<()> {
@@ -1741,7 +1775,11 @@ fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> App
     // built-in off) is the steady state and must not spam the log every 30s. cg_external_online
     // is logged as a cross-check: online-but-not-a-saved-target means a virtual/dummy/other
     // panel the guard is correctly ignoring.
-    if action == GuardAction::RestoreInternal || parsed.is_err() {
+    if action == GuardAction::RestoreInternal
+        || parsed.is_err()
+        || reason.starts_with("system-")
+        || reason.starts_with("wake-")
+    {
         log_event(&format!(
             "guard: reason={reason} clamshell={clamshell:?} target_connected={external_present} cg_external_online={cg_external_online} builtin_present={builtin_present} displayplacer={} action={action:?}",
             if parsed.is_ok() { "ok" } else { "unavailable" }
@@ -1764,51 +1802,125 @@ fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> App
     }
 }
 
+// A clamshell wake is different from periodic idle reconciliation: after the lid is opened,
+// an inactive built-in panel is not a legitimate DPMS steady state. Restore it even if the
+// pre-sleep external display is still reported as connected, because that report can remain a
+// phantom until another hotplug forces WindowServer to rebuild the topology. The post-wake hold
+// prevents the watcher from undoing the recovery until that saved target is active or absent.
+fn wake_recovery_action_for_state(
+    clamshell: ClamshellState,
+    aggressive_lid_recovery: bool,
+    builtin_active: bool,
+) -> GuardAction {
+    if clamshell == ClamshellState::Closed || builtin_active || !aggressive_lid_recovery {
+        GuardAction::None
+    } else {
+        GuardAction::RestoreInternal
+    }
+}
+
+fn run_wake_recovery_once(reason: &str, mode: ActionMode, verbose: bool) -> AppResult<()> {
+    let clamshell = read_clamshell_state(verbose);
+    let pending = pending_wake_restore()?;
+    let wake_reason_lid = read_wake_reason_contains_lid(verbose);
+    let aggressive_lid_recovery = wake_reason_lid
+        || pending
+            .map(|pending| pending.sleep_clamshell != ClamshellState::Open)
+            .unwrap_or(false);
+
+    if clamshell == ClamshellState::Closed {
+        if reason.starts_with("system-") {
+            log_event(&format!(
+                "wake-recovery: reason={reason} clamshell={clamshell:?} pending={pending:?} wake_reason_lid={wake_reason_lid} action=defer"
+            ));
+        }
+        return Ok(());
+    }
+
+    if !aggressive_lid_recovery {
+        log_event(&format!(
+            "wake-recovery: reason={reason} clamshell={clamshell:?} pending={pending:?} wake_reason_lid={wake_reason_lid} action=normal-guard"
+        ));
+        let result = run_internal_guard_once(reason, mode, verbose);
+        if result.is_ok() && mode == ActionMode::Execute {
+            clear_pending_wake_restore()?;
+        }
+        return result;
+    }
+
+    let builtin_active = if mode == ActionMode::DryRun {
+        false
+    } else {
+        wait_for_builtin_active(WAKE_BUILTIN_GRACE_PERIOD)
+    };
+    let action = wake_recovery_action_for_state(clamshell, true, builtin_active);
+    log_event(&format!(
+        "wake-recovery: reason={reason} clamshell={clamshell:?} pending={pending:?} wake_reason_lid={wake_reason_lid} builtin_active={builtin_active} action={action:?}"
+    ));
+
+    if action == GuardAction::RestoreInternal {
+        restore_internal_only_safety(mode, verbose, INTERNAL_RESTORE_ATTEMPTS)?;
+    }
+
+    if mode == ActionMode::Execute {
+        if !builtin_display_active() {
+            return Err("wake recovery completed without an active built-in display".into());
+        }
+        if aggressive_lid_recovery {
+            mark_wake_auto_disable_hold()?;
+        }
+        clear_pending_wake_restore()?;
+        log_event(&format!(
+            "wake-recovery: builtin active; cleared pending restore; auto_disable_hold={aggressive_lid_recovery}"
+        ));
+    }
+    Ok(())
+}
+
 fn restore_internal_only_safety(mode: ActionMode, verbose: bool, attempts: u32) -> AppResult<()> {
-    if let Err(error) = restore_internal_once(None, mode, false, verbose, attempts) {
+    let native_error = restore_internal_once(None, mode, false, verbose, attempts)
+        .err()
+        .map(|error| error.to_string());
+    if let Some(error) = native_error.as_deref() {
         if verbose {
             eprintln!("warning: native internal restore failed: {error}");
         }
+    } else if mode == ActionMode::DryRun || builtin_display_active() {
+        return Ok(());
     }
 
-    let parsed = match load_displayplacer_with_timeout(Duration::from_secs(2)) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            if verbose {
-                eprintln!("warning: could not verify internal restore: {error}");
-            }
-            return Ok(());
-        }
-    };
+    let parsed = load_displayplacer_with_timeout(Duration::from_secs(2)).map_err(|error| {
+        format!(
+            "could not verify internal restore after native result {}: {error}",
+            native_error.as_deref().unwrap_or("ok")
+        )
+    })?;
     if mode == ActionMode::Execute {
         remember_internal(&parsed);
     }
 
-    if parsed
-        .displays
-        .iter()
-        .any(|display| display.is_internal() && display.is_enabled())
-    {
+    let internal = parsed.displays.iter().find(|display| display.is_internal());
+    let fallback_error = if let Some(id) = internal.and_then(Display::stable_id) {
+        set_displayplacer_enabled(id, true, mode, verbose)
+            .err()
+            .map(|error| error.to_string())
+    } else {
+        Some("displayplacer did not report the built-in display".to_string())
+    };
+
+    if mode == ActionMode::DryRun {
+        return Ok(());
+    }
+    if wait_for_builtin_active(INTERNAL_RESTORE_VERIFY_TIMEOUT) {
         return Ok(());
     }
 
-    for display in parsed
-        .displays
-        .iter()
-        .filter(|display| display.is_internal() && !display.is_enabled())
-    {
-        let Some(id) = display.stable_id() else {
-            continue;
-        };
-        if let Err(error) = set_displayplacer_enabled(id, true, mode, verbose) {
-            if verbose {
-                eprintln!("warning: displayplacer internal restore failed: {error}");
-            }
-        }
-        return Ok(());
-    }
-
-    Ok(())
+    Err(format!(
+        "internal restore did not produce an active built-in display (native: {}; displayplacer: {})",
+        native_error.as_deref().unwrap_or("ok but inactive"),
+        fallback_error.as_deref().unwrap_or("ok but inactive")
+    )
+    .into())
 }
 
 // The guard is a restore-only safety net with one job: never let the lid-open Mac sit with
@@ -1850,10 +1962,14 @@ fn internal_guard_action_for_state(
 }
 
 fn read_clamshell_state(verbose: bool) -> ClamshellState {
+    read_clamshell_state_with_timeout(Duration::from_secs(1), verbose)
+}
+
+fn read_clamshell_state_with_timeout(timeout: Duration, verbose: bool) -> ClamshellState {
     match run_command_with_timeout(
         "ioreg",
         &["-r", "-k", "AppleClamshellState", "-d", "4"],
-        Duration::from_secs(1),
+        timeout,
     ) {
         Ok(output) => {
             let body = String::from_utf8_lossy(&output.stdout);
@@ -1870,6 +1986,34 @@ fn read_clamshell_state(verbose: bool) -> ClamshellState {
                 eprintln!("warning: clamshell state unavailable: {error}");
             }
             ClamshellState::Unknown
+        }
+    }
+}
+
+fn wake_reason_output_contains_lid(body: &str) -> bool {
+    body.lines()
+        .find(|line| line.contains("\"Wake Reason\""))
+        .and_then(|line| line.split_once('=').map(|(_, value)| value))
+        .map(|value| {
+            value
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .any(|token| token.eq_ignore_ascii_case("lid"))
+        })
+        .unwrap_or(false)
+}
+
+fn read_wake_reason_contains_lid(verbose: bool) -> bool {
+    match run_command_with_timeout(
+        "ioreg",
+        &["-r", "-k", "Wake Reason", "-d", "4"],
+        Duration::from_secs(1),
+    ) {
+        Ok(output) => wake_reason_output_contains_lid(&String::from_utf8_lossy(&output.stdout)),
+        Err(error) => {
+            if verbose {
+                eprintln!("warning: wake reason unavailable: {error}");
+            }
+            false
         }
     }
 }
@@ -1935,16 +2079,19 @@ unsafe extern "C" fn power_event_callback(
     }
 
     if message_type == K_IO_MESSAGE_SYSTEM_WILL_SLEEP {
-        let mode = if POWER_DRY_RUN.load(Ordering::SeqCst) {
-            ActionMode::DryRun
-        } else {
-            ActionMode::Execute
-        };
-        log_event("power: SystemWillSleep — restoring internal before sleep");
-        // Single attempt only: this callback must hand the power change back promptly
-        // (IOAllowPowerChange below), so it must not sit in the retry/verify loop and
-        // delay sleep. The wake-side guard is the robust recovery path.
-        let _ = restore_internal_only_safety(mode, false, 1);
+        let clamshell = read_clamshell_state_with_timeout(SLEEP_CLAMSHELL_PROBE_TIMEOUT, false);
+        match mark_pending_wake_restore(clamshell) {
+            Ok(()) => log_event(&format!(
+                "power: SystemWillSleep clamshell={clamshell:?} — armed wake restore"
+            )),
+            Err(error) => log_event(&format!(
+                "power: SystemWillSleep clamshell={clamshell:?} — failed to arm wake restore: {error}"
+            )),
+        }
+        // Never run display configuration synchronously from this callback. On lid close the
+        // private CGS transaction can block for about ten seconds and still fail, delaying
+        // sleep without improving the layout. Persist the recovery intent above, acknowledge
+        // immediately, and let the powered-on path verify and restore the panel.
         if root_port != 0 {
             let _ = unsafe { IOAllowPowerChange(root_port, message_argument as isize) };
         }
@@ -2446,7 +2593,28 @@ fn apply_watch_targets(
     let target_present = parsed.displays.iter().any(|display| {
         display.is_enabled() && targets.iter().any(|target| target.matches_display(display))
     });
-    apply_auto_watch_action(&parsed, target_present, None, mode, force, verbose)
+    let target_connected = any_target_connected(&parsed, targets);
+    let wake_hold = wake_auto_disable_hold()?;
+    let suppress_auto_disable =
+        wake_hold && target_connected && !active_saved_target_present(&parsed, targets);
+
+    if wake_hold && !suppress_auto_disable && mode == ActionMode::Execute {
+        clear_wake_auto_disable_hold()?;
+        log_event("wake-recovery: released auto-disable hold; saved target active or absent");
+    }
+    if suppress_auto_disable && verbose {
+        println!("auto watch: post-wake auto-disable held until saved target is active or absent");
+    }
+
+    apply_auto_watch_action(
+        &parsed,
+        target_present,
+        suppress_auto_disable,
+        None,
+        mode,
+        force,
+        verbose,
+    )
 }
 
 fn apply_raw_watch_target(
@@ -2464,18 +2632,27 @@ fn apply_raw_watch_target(
         .displays
         .iter()
         .any(|display| display.matches(target) && display.is_enabled());
-    apply_auto_watch_action(&parsed, target_present, Some(target), mode, force, verbose)
+    apply_auto_watch_action(
+        &parsed,
+        target_present,
+        false,
+        Some(target),
+        mode,
+        force,
+        verbose,
+    )
 }
 
 fn apply_auto_watch_action(
     parsed: &ParsedDisplayplacer,
     target_present: bool,
+    suppress_auto_disable: bool,
     raw_condition: Option<&str>,
     mode: ActionMode,
     force: bool,
     verbose: bool,
 ) -> AppResult<AutoWatchAction> {
-    match auto_watch_action_for_state(parsed, target_present) {
+    match auto_watch_action_for_state(parsed, target_present, suppress_auto_disable) {
         AutoWatchAction::DisabledInternal => {
             disable_internal_once_with_verbosity(raw_condition, mode, force, false, verbose)?;
             Ok(AutoWatchAction::DisabledInternal)
@@ -2532,8 +2709,40 @@ fn current_builtin_display_id() -> Option<CGDirectDisplayID> {
 
 fn builtin_display_active_in_process() -> bool {
     current_builtin_display_id()
-        .map(|id| unsafe { CGDisplayIsActive(id) != 0 })
+        .map(display_active_in_process)
         .unwrap_or(false)
+}
+
+fn display_active_in_process(display_id: CGDirectDisplayID) -> bool {
+    unsafe { CGDisplayIsActive(display_id) != 0 }
+}
+
+fn display_active(display_id: CGDirectDisplayID) -> bool {
+    let probe = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.to_str().map(String::from));
+    let Some(probe) = probe else {
+        return false;
+    };
+    let display_id = display_id.to_string();
+    match run_command_with_timeout(
+        &probe,
+        &["__probe-display-active", &display_id],
+        BUILTIN_PROBE_TIMEOUT,
+    ) {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+fn active_saved_target_present(parsed: &ParsedDisplayplacer, targets: &[MonitorTarget]) -> bool {
+    parsed.displays.iter().any(|display| {
+        targets.iter().any(|target| target.matches_display(display))
+            && display
+                .contextual_display_id()
+                .map(display_active)
+                .unwrap_or(false)
+    })
 }
 
 // The per-process CoreGraphics display snapshot resynchronizes only when a
@@ -2648,6 +2857,7 @@ fn display_loss_restore_action_for_change(
 fn auto_watch_action_for_state(
     parsed: &ParsedDisplayplacer,
     target_present: bool,
+    suppress_auto_disable: bool,
 ) -> AutoWatchAction {
     let internal_enabled = parsed
         .displays
@@ -2655,7 +2865,7 @@ fn auto_watch_action_for_state(
         .any(|display| display.is_internal() && display.is_enabled());
 
     if target_present {
-        if internal_enabled {
+        if internal_enabled && !suppress_auto_disable {
             AutoWatchAction::DisabledInternal
         } else {
             AutoWatchAction::None
@@ -3443,6 +3653,57 @@ fn remembered_internal_display_id() -> AppResult<Option<CGDirectDisplayID>> {
         .map_err(Into::into)
 }
 
+fn clamshell_state_name(state: ClamshellState) -> &'static str {
+    match state {
+        ClamshellState::Open => "open",
+        ClamshellState::Closed => "closed",
+        ClamshellState::Unknown => "unknown",
+    }
+}
+
+fn pending_wake_restore_from_body(body: &str) -> PendingWakeRestore {
+    let sleep_clamshell = match state_value_from_body(body, "sleep_clamshell").as_deref() {
+        Some("open") => ClamshellState::Open,
+        Some("closed") => ClamshellState::Closed,
+        _ => ClamshellState::Unknown,
+    };
+    PendingWakeRestore { sleep_clamshell }
+}
+
+fn mark_pending_wake_restore(sleep_clamshell: ClamshellState) -> AppResult<()> {
+    let body = format!(
+        "created_at={}\nsleep_clamshell={}\n",
+        unix_timestamp()?,
+        clamshell_state_name(sleep_clamshell)
+    );
+    write_support_file(PENDING_WAKE_RESTORE_FILE_NAME, &body)
+}
+
+fn pending_wake_restore() -> AppResult<Option<PendingWakeRestore>> {
+    Ok(read_support_file(PENDING_WAKE_RESTORE_FILE_NAME)?
+        .as_deref()
+        .map(pending_wake_restore_from_body))
+}
+
+fn clear_pending_wake_restore() -> AppResult<()> {
+    remove_support_file(PENDING_WAKE_RESTORE_FILE_NAME)
+}
+
+fn mark_wake_auto_disable_hold() -> AppResult<()> {
+    write_support_file(
+        WAKE_AUTO_DISABLE_HOLD_FILE_NAME,
+        &format!("created_at={}\n", unix_timestamp()?),
+    )
+}
+
+fn wake_auto_disable_hold() -> AppResult<bool> {
+    Ok(read_support_file(WAKE_AUTO_DISABLE_HOLD_FILE_NAME)?.is_some())
+}
+
+fn clear_wake_auto_disable_hold() -> AppResult<()> {
+    remove_support_file(WAKE_AUTO_DISABLE_HOLD_FILE_NAME)
+}
+
 fn read_support_file(file_name: &str) -> AppResult<Option<String>> {
     let path = support_file_path(file_name)?;
     match fs::read_to_string(&path) {
@@ -3986,8 +4247,18 @@ displayplacer "id:ABC enabled:true"
         let parsed = parsed_with_displays(vec![internal_display(true), external_display(true)]);
 
         assert_eq!(
-            auto_watch_action_for_state(&parsed, true),
+            auto_watch_action_for_state(&parsed, true, false),
             AutoWatchAction::DisabledInternal
+        );
+    }
+
+    #[test]
+    fn auto_watch_does_not_undo_a_held_wake_recovery() {
+        let parsed = parsed_with_displays(vec![internal_display(true), external_display(true)]);
+
+        assert_eq!(
+            auto_watch_action_for_state(&parsed, true, true),
+            AutoWatchAction::None
         );
     }
 
@@ -3996,7 +4267,7 @@ displayplacer "id:ABC enabled:true"
         let parsed = parsed_with_displays(vec![external_display(true)]);
 
         assert_eq!(
-            auto_watch_action_for_state(&parsed, true),
+            auto_watch_action_for_state(&parsed, true, false),
             AutoWatchAction::None
         );
     }
@@ -4006,7 +4277,7 @@ displayplacer "id:ABC enabled:true"
         let parsed = parsed_with_displays(vec![external_display(false)]);
 
         assert_eq!(
-            auto_watch_action_for_state(&parsed, false),
+            auto_watch_action_for_state(&parsed, false, false),
             AutoWatchAction::RestoredInternal
         );
     }
@@ -4016,7 +4287,7 @@ displayplacer "id:ABC enabled:true"
         let parsed = parsed_with_displays(vec![internal_display(true)]);
 
         assert_eq!(
-            auto_watch_action_for_state(&parsed, false),
+            auto_watch_action_for_state(&parsed, false, false),
             AutoWatchAction::None
         );
     }
@@ -4106,6 +4377,64 @@ displayplacer "id:ABC enabled:true"
         assert_eq!(
             internal_guard_action_for_state(ClamshellState::Open, false, false),
             GuardAction::RestoreInternal
+        );
+    }
+
+    #[test]
+    fn lid_wake_restores_when_builtin_is_not_active() {
+        assert_eq!(
+            wake_recovery_action_for_state(ClamshellState::Open, true, false),
+            GuardAction::RestoreInternal
+        );
+    }
+
+    #[test]
+    fn lid_wake_stays_idle_when_builtin_is_active() {
+        assert_eq!(
+            wake_recovery_action_for_state(ClamshellState::Open, true, true),
+            GuardAction::None
+        );
+    }
+
+    #[test]
+    fn non_lid_wake_preserves_normal_guard_policy() {
+        assert_eq!(
+            wake_recovery_action_for_state(ClamshellState::Open, false, false),
+            GuardAction::None
+        );
+    }
+
+    #[test]
+    fn pending_lid_recovery_defers_while_clamshell_is_closed() {
+        assert_eq!(
+            wake_recovery_action_for_state(ClamshellState::Closed, true, false),
+            GuardAction::None
+        );
+    }
+
+    #[test]
+    fn wake_reason_parser_matches_lid_as_a_token_only() {
+        assert!(wake_reason_output_contains_lid(
+            r#"|   "Wake Reason" = "smc.sysState.Wake lid RTP.multi-touch""#
+        ));
+        assert!(!wake_reason_output_contains_lid(
+            r#"|   "Wake Reason" = "rtc/Maintenance HID Activity""#
+        ));
+    }
+
+    #[test]
+    fn pending_wake_restore_parser_preserves_sleep_clamshell_state() {
+        assert_eq!(
+            pending_wake_restore_from_body("created_at=1\nsleep_clamshell=closed\n"),
+            PendingWakeRestore {
+                sleep_clamshell: ClamshellState::Closed,
+            }
+        );
+        assert_eq!(
+            pending_wake_restore_from_body("created_at=1\n"),
+            PendingWakeRestore {
+                sleep_clamshell: ClamshellState::Unknown,
+            }
         );
     }
 
