@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::CString;
 use std::ffi::OsStr;
@@ -54,7 +54,9 @@ type IoNotificationPortRef = *mut std::ffi::c_void;
 type IoReturn = i32;
 type Natural = u32;
 const K_CG_CONFIGURE_PERMANENTLY: i32 = 1;
+const K_CG_DISPLAY_ADD_FLAG: CGDisplayChangeSummaryFlags = 1 << 4;
 const K_CG_DISPLAY_REMOVE_FLAG: CGDisplayChangeSummaryFlags = 1 << 5;
+const K_CG_DISPLAY_ENABLED_FLAG: CGDisplayChangeSummaryFlags = 1 << 8;
 const K_CG_DISPLAY_DISABLED_FLAG: CGDisplayChangeSummaryFlags = 1 << 9;
 const K_IO_MESSAGE_CAN_SYSTEM_SLEEP: Natural = 0xe0000270;
 const K_IO_MESSAGE_SYSTEM_WILL_SLEEP: Natural = 0xe0000280;
@@ -82,6 +84,7 @@ unsafe extern "C" {
     ) -> CGError;
     fn CGDisplayIsBuiltin(display: CGDirectDisplayID) -> i32;
     fn CGDisplayIsActive(display: CGDirectDisplayID) -> i32;
+    fn CGDisplayIsInMirrorSet(display: CGDirectDisplayID) -> u32;
     fn CGGetOnlineDisplayList(
         max_displays: u32,
         online_displays: *mut CGDirectDisplayID,
@@ -313,6 +316,50 @@ struct ParsedDisplayplacer {
     displays: Vec<Display>,
     restore_command: Option<String>,
     raw: String,
+}
+
+impl ParsedDisplayplacer {
+    fn still_reports_lost_display(
+        &self,
+        id: CGDirectDisplayID,
+        flags: CGDisplayChangeSummaryFlags,
+    ) -> bool {
+        self.displays.iter().any(|d| {
+            !d.remembered_absent
+                && d.contextual_display_id() == Some(id)
+                && (flags & K_CG_DISPLAY_REMOVE_FLAG != 0 || d.enabled != Some(false))
+        })
+    }
+
+    fn matches_idle_layout(
+        &self,
+        activity: &[(CGDirectDisplayID, bool)],
+        targets: &[MonitorTarget],
+    ) -> bool {
+        let mut live = self.displays.iter().filter(|d| !d.remembered_absent);
+        // A saved, physically connected monitor can be dark in DPMS. An
+        // unrelated or remembered monitor must never veto a built-in restore.
+        let idle = if targets.is_empty() {
+            live.clone().any(Display::is_enabled)
+        } else {
+            let mut connected = live
+                .clone()
+                .filter(|d| targets.iter().any(|t| t.matches_display(d)));
+            let target_enabled = connected.clone().any(Display::is_enabled);
+            match auto_watch_action_for_state(self, target_enabled, false) {
+                AutoWatchAction::None => true,
+                AutoWatchAction::RestoredInternal => connected.next().is_some(),
+                AutoWatchAction::DisabledInternal => false,
+            }
+        };
+        idle && live.clone().count() == activity.len()
+            && live.all(|display| {
+                display
+                    .contextual_display_id()
+                    .zip(display.enabled)
+                    .is_some_and(|state| activity.contains(&state))
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,6 +616,9 @@ fn interactive_mode() -> AppResult<()> {
     let mut targets = load_targets()?;
     let mut selected = 0usize;
     let mut show_help = false;
+    let notifications_ready = event_status.is_none() && power_status.is_none();
+    let mut settled_activity = Vec::new();
+    let mut unconfirmed_losses = BTreeMap::new();
     let mut status = event_status
         .or(power_status)
         .unwrap_or_else(|| "ready".to_string());
@@ -713,9 +763,17 @@ fn interactive_mode() -> AppResult<()> {
             }
         }
 
+        let mut reconcile = false;
         while let Ok(event) = watch_rx.try_recv() {
             match event {
                 WatchEvent::DisplayChanged(change) => {
+                    if change.is_display_loss() {
+                        *unconfirmed_losses.entry(change.display).or_insert(0) |= change.flags;
+                    } else if change.flags & (K_CG_DISPLAY_ADD_FLAG | K_CG_DISPLAY_ENABLED_FLAG)
+                        != 0
+                    {
+                        unconfirmed_losses.remove(&change.display);
+                    }
                     log_event(&format!(
                         "display-change: display={} flags={:#x} loss={}",
                         change.display,
@@ -741,25 +799,7 @@ fn interactive_mode() -> AppResult<()> {
                     }
                     needs_render = true;
                 }
-                WatchEvent::Reconcile => {
-                    should_refresh = true;
-                    match apply_interactive_display_recovery(
-                        &targets,
-                        ActionMode::Execute,
-                        false,
-                        false,
-                    ) {
-                        Ok(AutoWatchAction::DisabledInternal) => {
-                            status = "auto target reconciled; internal disabled".to_string()
-                        }
-                        Ok(AutoWatchAction::RestoredInternal) => {
-                            status = "internal restore requested".to_string()
-                        }
-                        Ok(AutoWatchAction::None) => status = "periodic reconcile".to_string(),
-                        Err(error) => status = format!("display recovery failed: {error}"),
-                    }
-                    needs_render = true;
-                }
+                WatchEvent::Reconcile => reconcile = true,
             }
         }
 
@@ -782,7 +822,59 @@ fn interactive_mode() -> AppResult<()> {
         }
 
         if should_refresh {
+            // Recheck after input, hotplug, or wake settles, even if a timer tick
+            // was queued during recovery.
+            settled_activity.clear();
+        } else if reconcile {
+            // Only skip an idle timer tick after a fresh recovery check found
+            // nothing to do. Unplug and wake must always take their fresh paths:
+            // the process-local CoreGraphics view can be stale after sleep.
+            let activity = if notifications_ready
+                && unconfirmed_losses.is_empty()
+                && matches!(pending_wake_restore(), Ok(None))
+                && (targets.is_empty() || matches!(wake_auto_disable_hold(), Ok(false)))
+            {
+                online_display_activity()
+            } else {
+                Vec::new()
+            };
+            if activity.is_empty() || activity != settled_activity {
+                settled_activity.clear();
+                should_refresh = true;
+                match apply_interactive_display_recovery(
+                    &targets,
+                    ActionMode::Execute,
+                    false,
+                    false,
+                ) {
+                    Ok(AutoWatchAction::DisabledInternal) => {
+                        status = "auto target reconciled; internal disabled".to_string()
+                    }
+                    Ok(AutoWatchAction::RestoredInternal) => {
+                        status = "internal restore requested".to_string()
+                    }
+                    Ok(AutoWatchAction::None) => {
+                        settled_activity = activity;
+                        status = "periodic reconcile".to_string();
+                    }
+                    Err(error) => status = format!("display recovery failed: {error}"),
+                }
+            }
+        }
+
+        if should_refresh {
             parsed = load_display_state_for_ui(&mut selected, &mut status);
+            if let Some(ui) = &parsed {
+                // A fresh list can still describe the old layout during unplug.
+                // Keep polling until the reported loss is visible or the panel returns.
+                unconfirmed_losses.retain(|id, flags| ui.still_reports_lost_display(*id, *flags));
+            }
+            if !parsed
+                .as_ref()
+                .is_some_and(|ui| ui.matches_idle_layout(&settled_activity, &targets))
+            {
+                settled_activity.clear();
+            }
             needs_render = true;
         }
 
@@ -1656,13 +1748,13 @@ fn saved_target_connected() -> bool {
     }
 }
 
-fn restore_internal_safety(mode: ActionMode, verbose: bool) -> AppResult<()> {
+fn restore_internal_safety(mode: ActionMode, verbose: bool) -> AppResult<AutoWatchAction> {
     // With the lid closed the panel cannot light up: every enable fails (err 1014) and
     // during closed-lid sleep this path used to spam failing CGS transactions for hours,
     // colliding with macOS's own reconfiguration. The guard restores once the lid opens.
     if read_clamshell_state(verbose) == ClamshellState::Closed {
         log_event("internal safety restore: skipped (clamshell closed)");
-        return Ok(());
+        return Ok(AutoWatchAction::None);
     }
 
     // A saved auto-target still connected (online, even in idle DPMS display-sleep where
@@ -1678,7 +1770,7 @@ fn restore_internal_safety(mode: ActionMode, verbose: bool) -> AppResult<()> {
         if verbose {
             println!("internal safety restore: skipped (saved target connected)");
         }
-        return Ok(());
+        return Ok(AutoWatchAction::None);
     }
 
     if verbose {
@@ -1693,7 +1785,8 @@ fn restore_internal_safety(mode: ActionMode, verbose: bool) -> AppResult<()> {
     // Only the built-in panel is restored here. Enabling every remembered contextual id
     // (as this once did) can silently power an external instead, because macOS reuses
     // those ids across monitors and deep sleeps.
-    enable_internal_with_retry(None, INTERNAL_RESTORE_ATTEMPTS, mode, verbose)
+    enable_internal_with_retry(None, INTERNAL_RESTORE_ATTEMPTS, mode, verbose)?;
+    Ok(AutoWatchAction::RestoredInternal)
 }
 
 fn guard(args: Vec<String>) -> AppResult<()> {
@@ -1757,8 +1850,10 @@ fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> App
         .as_ref()
         .map(|p| any_target_connected(p, &targets))
         .unwrap_or(false);
-    let (cg_external_online, builtin_present) = display_presence();
-    let action = internal_guard_action_for_state(clamshell, external_present, builtin_present);
+    // The fresh child opens a WindowServer connection. Launch it only when the
+    // built-in can change the decision or a diagnostic needs the actual values.
+    let presence = std::cell::LazyCell::new(display_presence);
+    let action = internal_guard_action_for_state(clamshell, external_present, || presence.1);
 
     if let Ok(parsed) = parsed.as_ref() {
         if mode == ActionMode::Execute {
@@ -1780,6 +1875,7 @@ fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> App
         || reason.starts_with("system-")
         || reason.starts_with("wake-")
     {
+        let (cg_external_online, builtin_present) = *presence;
         log_event(&format!(
             "guard: reason={reason} clamshell={clamshell:?} target_connected={external_present} cg_external_online={cg_external_online} builtin_present={builtin_present} displayplacer={} action={action:?}",
             if parsed.is_ok() { "ok" } else { "unavailable" }
@@ -1950,12 +2046,12 @@ fn restore_internal_only_safety(mode: ActionMode, verbose: bool, attempts: u32) 
 fn internal_guard_action_for_state(
     clamshell: ClamshellState,
     external_present: bool,
-    builtin_present: bool,
+    builtin_present: impl FnOnce() -> bool,
 ) -> GuardAction {
     if clamshell == ClamshellState::Closed {
         return GuardAction::None;
     }
-    if external_present || builtin_present {
+    if external_present || builtin_present() {
         return GuardAction::None;
     }
     GuardAction::RestoreInternal
@@ -2525,14 +2621,13 @@ fn apply_interactive_display_recovery(
     force: bool,
     verbose: bool,
 ) -> AppResult<AutoWatchAction> {
-    if !targets.is_empty() {
-        match apply_watch_targets(targets, mode, force, verbose)? {
-            AutoWatchAction::None => {}
-            action => return Ok(action),
-        }
+    if targets.is_empty() {
+        apply_no_enabled_display_safety(mode, verbose)
+    } else {
+        // Target recovery already requests a restore when neither a target
+        // nor the built-in is enabled, including the all-displays-off case.
+        apply_watch_targets(targets, mode, force, verbose)
     }
-
-    apply_no_enabled_display_safety(mode, verbose)
 }
 
 fn apply_interactive_display_recovery_for_change(
@@ -2548,8 +2643,7 @@ fn apply_interactive_display_recovery_for_change(
         display_is_builtin(change.display),
     ) {
         AutoWatchAction::RestoredInternal => {
-            restore_internal_safety(mode, verbose)?;
-            return Ok(AutoWatchAction::RestoredInternal);
+            return restore_internal_safety(mode, verbose);
         }
         AutoWatchAction::None if change.is_display_loss() => return Ok(AutoWatchAction::None),
         AutoWatchAction::None => {}
@@ -2566,10 +2660,7 @@ fn apply_no_enabled_display_safety(mode: ActionMode, verbose: bool) -> AppResult
     remember_internal(&parsed);
 
     match no_enabled_display_safety_action_for_state(&parsed) {
-        AutoWatchAction::RestoredInternal => {
-            restore_internal_safety(mode, verbose)?;
-            Ok(AutoWatchAction::RestoredInternal)
-        }
+        AutoWatchAction::RestoredInternal => restore_internal_safety(mode, verbose),
         AutoWatchAction::None => Ok(AutoWatchAction::None),
         AutoWatchAction::DisabledInternal => Ok(AutoWatchAction::None),
     }
@@ -2657,10 +2748,7 @@ fn apply_auto_watch_action(
             disable_internal_once_with_verbosity(raw_condition, mode, force, false, verbose)?;
             Ok(AutoWatchAction::DisabledInternal)
         }
-        AutoWatchAction::RestoredInternal => {
-            restore_internal_safety(mode, verbose)?;
-            Ok(AutoWatchAction::RestoredInternal)
-        }
+        AutoWatchAction::RestoredInternal => restore_internal_safety(mode, verbose),
         AutoWatchAction::None => Ok(AutoWatchAction::None),
     }
 }
@@ -2695,6 +2783,19 @@ fn online_display_ids() -> Vec<CGDirectDisplayID> {
         return Vec::new();
     }
     ids[..count as usize].to_vec()
+}
+
+fn online_display_activity() -> Vec<(CGDirectDisplayID, bool)> {
+    let mut ids = online_display_ids();
+    ids.sort_unstable();
+    ids.into_iter()
+        .map(|id| {
+            // displayplacer also reports a display in a mirror set as enabled.
+            let enabled =
+                display_active_in_process(id) || unsafe { CGDisplayIsInMirrorSet(id) != 0 };
+            (id, enabled)
+        })
+        .collect()
 }
 
 // Resolve the built-in display's *current* CGDirectDisplayID from the live online list.
@@ -4327,7 +4428,9 @@ displayplacer "id:ABC enabled:true"
         // Closed lid short-circuits regardless of display state, so closed-lid clamshell
         // use is never disturbed.
         assert_eq!(
-            internal_guard_action_for_state(ClamshellState::Closed, false, false),
+            internal_guard_action_for_state(ClamshellState::Closed, false, || panic!(
+                "unneeded probe"
+            )),
             GuardAction::None
         );
     }
@@ -4337,7 +4440,7 @@ displayplacer "id:ABC enabled:true"
         // Built-in enabled (online), no external. Nothing to restore; re-enabling would only
         // wake it needlessly.
         assert_eq!(
-            internal_guard_action_for_state(ClamshellState::Open, false, true),
+            internal_guard_action_for_state(ClamshellState::Open, false, || true),
             GuardAction::None
         );
     }
@@ -4351,7 +4454,9 @@ displayplacer "id:ABC enabled:true"
         // and an active-based check would wrongly restore here every 30s during idle,
         // re-fighting the watcher and heating the Mac. Online keeps this a stand-down.
         assert_eq!(
-            internal_guard_action_for_state(ClamshellState::Open, true, false),
+            internal_guard_action_for_state(ClamshellState::Open, true, || panic!(
+                "unneeded probe"
+            )),
             GuardAction::None
         );
     }
@@ -4360,7 +4465,7 @@ displayplacer "id:ABC enabled:true"
     fn guard_stays_idle_when_both_panels_are_present() {
         // Monitor-B style "both on": external present and built-in present.
         assert_eq!(
-            internal_guard_action_for_state(ClamshellState::Open, true, true),
+            internal_guard_action_for_state(ClamshellState::Open, true, || true),
             GuardAction::None
         );
     }
@@ -4375,7 +4480,7 @@ displayplacer "id:ABC enabled:true"
         //   * fail-open — a read that cannot confirm a panel reports both absent (false), so
         //     an unreadable/confused system recovers the built-in rather than stranding.
         assert_eq!(
-            internal_guard_action_for_state(ClamshellState::Open, false, false),
+            internal_guard_action_for_state(ClamshellState::Open, false, || false),
             GuardAction::RestoreInternal
         );
     }
@@ -4559,6 +4664,50 @@ displayplacer "id:ABC enabled:true"
             restore_command: None,
             raw: String::new(),
         }
+    }
+
+    #[test]
+    fn idle_check_requires_a_matching_live_display_set() {
+        let mut absent = external_display(false);
+        absent.remembered_absent = true;
+        let ui = parsed_with_displays(vec![absent, internal_display(true)]);
+        assert!(ui.matches_idle_layout(&[(1, true)], &[]));
+        assert!(!ui.matches_idle_layout(&[(2, true)], &[]));
+        assert!(!ui.matches_idle_layout(&[(1, true), (2, false)], &[]));
+        assert!(!ui.matches_idle_layout(&[], &[]));
+
+        let dark = parsed_with_displays(vec![internal_display(false)]);
+        assert!(!dark.matches_idle_layout(&[(1, false)], &[]));
+        assert!(!dark.matches_idle_layout(&[(1, true)], &[]));
+    }
+
+    #[test]
+    fn idle_check_accepts_a_sleeping_target_only_while_it_is_connected() {
+        let external = external_display(false);
+        let targets = [MonitorTarget::from_display(&external).unwrap()];
+        let asleep = parsed_with_displays(vec![external.clone()]);
+        assert!(asleep.matches_idle_layout(&[(2, false)], &targets));
+        assert!(!asleep.matches_idle_layout(&[(2, false)], &[]));
+
+        let mut remembered = external;
+        remembered.remembered_absent = true;
+        let unplugged = parsed_with_displays(vec![remembered]);
+        assert!(!unplugged.matches_idle_layout(&[], &targets));
+        let both_on = parsed_with_displays(vec![internal_display(true), external_display(true)]);
+        assert!(!both_on.matches_idle_layout(&[(1, true), (2, true)], &targets));
+    }
+
+    #[test]
+    fn a_loss_callback_requires_confirmation_from_the_live_list() {
+        let live = parsed_with_displays(vec![external_display(true)]);
+        assert!(live.still_reports_lost_display(2, K_CG_DISPLAY_DISABLED_FLAG));
+        let dark = parsed_with_displays(vec![external_display(false)]);
+        assert!(!dark.still_reports_lost_display(2, K_CG_DISPLAY_DISABLED_FLAG));
+        assert!(dark.still_reports_lost_display(2, K_CG_DISPLAY_REMOVE_FLAG));
+        let mut absent = external_display(false);
+        absent.remembered_absent = true;
+        let unplugged = parsed_with_displays(vec![absent]);
+        assert!(!unplugged.still_reports_lost_display(2, K_CG_DISPLAY_REMOVE_FLAG));
     }
 
     fn internal_display(enabled: bool) -> Display {

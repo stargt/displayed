@@ -135,45 +135,30 @@ non-internal display remove/disable event, interactive mode runs the safety
 restore before trusting the latest `displayplacer` state because that state can
 be stale during hot unplug. A remembered internal display disable event is not a
 restore trigger, so auto-disabling the built-in display cannot loop against the
-safety restore. Interactive mode reconciles every 5 seconds; non-interactive
-watch uses the requested interval, defaulting to 60 seconds.
+safety restore. Every 5 seconds, the interactive watcher checks the online
+display IDs and their enabled state on its existing CoreGraphics connection.
+Once a fresh recovery check finds a healthy, unchanged layout, idle ticks
+skip the `displayplacer list` subprocesses and terminal redraw. Display and
+power events still trigger fresh checks. While wake recovery is pending, or if
+notification registration fails or the layout cannot be verified, the watcher
+keeps the full periodic check.
+Non-interactive watch uses the requested interval, defaulting to 60 seconds.
 
 ## Internal Display Guard
 
 `displayed guard` is a one-shot safety check. It never disables the internal
 display and never rearranges displays. It restores the internal display only when
-the MacBook lid is open, no external display is present on the desktop, and the
-built-in itself is absent. If the lid is closed, it stays idle so normal clamshell
-use is not disturbed. If it cannot confirm any panel, it fails open by restoring
-the internal display, so a confused or unreadable system still recovers a usable
-screen.
+the lid permits recovery, no saved auto-target is connected, and the built-in
+itself is absent. A closed lid leaves the guard idle.
 
-The decision reads the authoritative CoreGraphics **online** display list through
-a freshly spawned probe ("which panels are present on the desktop?"), not
-`displayplacer` enabled flags and not `CGDisplayIsActive`. Each choice is
-deliberate:
-
-- **Fresh probe, not the in-process snapshot.** A long-lived process's cached
-  CoreGraphics view can keep listing a panel that an unplug-during-sleep already
-  dropped, a false positive that once vetoed every restore. A freshly spawned
-  child queries WindowServer anew, which avoids that per-process cache. WindowServer
-  itself can still retain a pre-sleep phantom until another hotplug; the lid-wake
-  recovery described below handles that narrower case without changing periodic
-  idle behavior.
-- **Online (present), not active (lit).** An external in idle DPMS display-sleep
-  is still online but reports `CGDisplayIsActive = false`; an active-based check
-  would therefore decide "no external" and re-enable the built-in every 30s during
-  idle, fighting the watcher and heating the Mac. Online is true for a connected
-  panel whether lit or display-asleep, and false only when the panel is unplugged
-  or intentionally disabled (the auto-off built-in leaves the list).
-- **Not `displayplacer`.** The decision no longer depends on `displayplacer` being
-  on the guard's `PATH`, whose absence once made the guard restore every 30s and
-  fight the watcher into a flicker.
-
-For periodic reconciliation, "is a panel present?" is answered directly and
-freshly so intentional auto-off / idle display-sleep does not cause repeated
-restore attempts. Lid wake has a stricter one-shot active-panel check because a
-pre-sleep phantom can otherwise make an unusable layout look present.
+Each run reads a fresh `displayplacer list` to identify connected saved targets,
+including a monitor in display sleep. A closed lid or a connected saved target
+already settles the periodic decision. Otherwise, a fresh CoreGraphics child
+checks whether the built-in belongs to the online display list. An enabled
+built-in remains online during display sleep. A probe failure counts as absent
+and allows recovery. Power-event diagnostics and failed display reads still
+request the full probe. Lid wake has a separate active-panel check because
+WindowServer can retain a pre-sleep display after the monitor is unplugged.
 
 The long-running watcher's restore path shares this signal: it will not restore
 the built-in while an external is present on the desktop, so a display-asleep
