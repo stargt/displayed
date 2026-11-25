@@ -1,3 +1,5 @@
+mod periodic_guard;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::CString;
@@ -66,6 +68,7 @@ static POWER_ROOT_PORT: AtomicU32 = AtomicU32::new(0);
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
+    fn CGSessionCopyCurrentDictionary() -> *const std::ffi::c_void;
     fn CGBeginDisplayConfiguration(config: *mut CGDisplayConfigRef) -> CGError;
     fn CGCompleteDisplayConfiguration(config: CGDisplayConfigRef, option: i32) -> CGError;
     fn CGCancelDisplayConfiguration(config: CGDisplayConfigRef) -> CGError;
@@ -122,6 +125,7 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
+    fn CFRelease(value: *const std::ffi::c_void);
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFRunLoopRun();
@@ -598,7 +602,30 @@ fn list_displays() -> AppResult<()> {
     Ok(())
 }
 
+fn require_graphics_session() -> AppResult<()> {
+    // A PTY and a logged-in UID can both exist outside the Quartz session.
+    // A GUI session with zero online screens must still be allowed to recover.
+    let session = unsafe { CGSessionCopyCurrentDictionary() };
+    if session.is_null() {
+        return Err("no macOS graphical login session is available to this process. Run displayed from a terminal in the logged-in desktop session".into());
+    }
+    unsafe { CFRelease(session) };
+    Ok(())
+}
+
+struct FailedReconcile {
+    activity: Vec<(CGDirectDisplayID, bool)>,
+    retry_at: Instant,
+}
+
+impl FailedReconcile {
+    fn waiting(&self, activity: &[(CGDirectDisplayID, bool)], now: Instant) -> bool {
+        self.activity == activity && now < self.retry_at
+    }
+}
+
 fn interactive_mode() -> AppResult<()> {
+    require_graphics_session()?;
     let _terminal = TerminalGuard::enter()?;
     let (watch_rx, _display_events, event_status) =
         start_display_event_source(DEFAULT_INTERACTIVE_RECONCILE_INTERVAL_SECS);
@@ -618,6 +645,7 @@ fn interactive_mode() -> AppResult<()> {
     let mut show_help = false;
     let notifications_ready = event_status.is_none() && power_status.is_none();
     let mut settled_activity = Vec::new();
+    let mut failed_reconcile: Option<FailedReconcile> = None;
     let mut unconfirmed_losses = BTreeMap::new();
     let mut status = event_status
         .or(power_status)
@@ -825,6 +853,7 @@ fn interactive_mode() -> AppResult<()> {
             // Recheck after input, hotplug, or wake settles, even if a timer tick
             // was queued during recovery.
             settled_activity.clear();
+            failed_reconcile = None;
         } else if reconcile {
             // Only skip an idle timer tick after a fresh recovery check found
             // nothing to do. Unplug and wake must always take their fresh paths:
@@ -838,7 +867,11 @@ fn interactive_mode() -> AppResult<()> {
             } else {
                 Vec::new()
             };
-            if activity.is_empty() || activity != settled_activity {
+            let waiting = failed_reconcile
+                .as_ref()
+                .is_some_and(|failed| failed.waiting(&activity, Instant::now()));
+            if !waiting && (activity.is_empty() || activity != settled_activity) {
+                failed_reconcile = None;
                 settled_activity.clear();
                 should_refresh = true;
                 match apply_interactive_display_recovery(
@@ -857,7 +890,16 @@ fn interactive_mode() -> AppResult<()> {
                         settled_activity = activity;
                         status = "periodic reconcile".to_string();
                     }
-                    Err(error) => status = format!("display recovery failed: {error}"),
+                    Err(error) => {
+                        // Keep the initial recovery attempts. A new hardware/power
+                        // event bypasses this delay even if the layout looks unchanged.
+                        failed_reconcile = Some(FailedReconcile {
+                            activity,
+                            retry_at: Instant::now()
+                                + Duration::from_secs(DEFAULT_GUARD_INTERVAL_SECS),
+                        });
+                        status = format!("display recovery failed: {error}");
+                    }
                 }
             }
         }
@@ -1521,6 +1563,7 @@ fn enable_internal_with_retry(
         return set_native_display_enabled(candidates[0], true, mode, verbose);
     }
 
+    require_graphics_session()?;
     let mut last_error: Option<String> = None;
     for attempt in 1..=attempts.max(1) {
         if attempt > 1 {
@@ -1811,6 +1854,12 @@ fn guard(args: Vec<String>) -> AppResult<()> {
         i += 1;
     }
 
+    if reason == "launchd" && mode == ActionMode::Execute {
+        return periodic_guard::run(verbose);
+    }
+    if mode == ActionMode::Execute {
+        require_graphics_session()?;
+    }
     if pending_wake_restore()?.is_some() {
         run_wake_recovery_once(&reason, mode, verbose)
     } else {
@@ -1819,11 +1868,21 @@ fn guard(args: Vec<String>) -> AppResult<()> {
 }
 
 fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> AppResult<()> {
+    let clamshell = read_clamshell_state(verbose);
+    let targets = load_targets().unwrap_or_default();
+    check_internal_guard(reason, mode, verbose, clamshell, &targets).map(|_| ())
+}
+
+fn check_internal_guard(
+    reason: &str,
+    mode: ActionMode,
+    verbose: bool,
+    clamshell: ClamshellState,
+    targets: &[MonitorTarget],
+) -> AppResult<Option<ParsedDisplayplacer>> {
     if verbose {
         println!("guard: reason={reason}");
     }
-
-    let clamshell = read_clamshell_state(verbose);
 
     // Load displayplacer once (freshly, so it is phantom-safe): it refreshes the remembered
     // built-in id, enriches the log, AND provides the stable-identity match for "is a saved
@@ -1845,10 +1904,9 @@ fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> App
     // restore (incident of 2026-07-14), and so an intentional auto-off / idle display-sleep (a
     // real panel present) can never be confused with a black-screen emergency (no usable
     // display) — the ambiguity that let this pair of failures oscillate across past fixes.
-    let targets = load_targets().unwrap_or_default();
     let external_present = parsed
         .as_ref()
-        .map(|p| any_target_connected(p, &targets))
+        .map(|p| any_target_connected(p, targets))
         .unwrap_or(false);
     // The fresh child opens a WindowServer connection. Launch it only when the
     // built-in can change the decision or a diagnostic needs the actual values.
@@ -1887,15 +1945,15 @@ fn run_internal_guard_once(reason: &str, mode: ActionMode, verbose: bool) -> App
             if verbose {
                 println!("guard: no internal restore needed");
             }
-            Ok(())
         }
         GuardAction::RestoreInternal => {
             if verbose {
                 println!("guard: restoring internal display");
             }
-            restore_internal_only_safety(mode, verbose, INTERNAL_RESTORE_ATTEMPTS)
+            restore_internal_only_safety(mode, verbose, INTERNAL_RESTORE_ATTEMPTS)?;
         }
     }
+    Ok(parsed.ok())
 }
 
 // A clamshell wake is different from periodic idle reconciliation: after the lid is opened,
@@ -1915,10 +1973,59 @@ fn wake_recovery_action_for_state(
     }
 }
 
+fn lock_wake_recovery() -> io::Result<fs::File> {
+    let path =
+        support_file_path("wake-recovery.lock").map_err(|e| io::Error::other(e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.try_lock().map_err(io::Error::from)?;
+    Ok(file)
+}
+
 fn run_wake_recovery_once(reason: &str, mode: ActionMode, verbose: bool) -> AppResult<()> {
+    // A process exit releases the lock so the next guard interval can retry.
+    let _lock = if mode == ActionMode::Execute {
+        match lock_wake_recovery() {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => {
+                log_event(&format!(
+                    "wake-recovery: cannot lock concurrent recovery: {error}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let clamshell = read_clamshell_state(verbose);
-    let pending = pending_wake_restore()?;
-    let wake_reason_lid = read_wake_reason_contains_lid(verbose);
+    let mut pending = pending_wake_restore()?;
+    let wake = periodic_guard::Wake::read();
+    if reason == "launchd-lid-wake" && mode == ActionMode::Execute && pending.is_none() {
+        if wake.as_ref().is_some_and(|w| w.lid && w.was_acknowledged()) {
+            return Ok(());
+        }
+        // The watcher was absent or missed the event. Keep the repair armed
+        // through a failure, a closed lid, or a later change of wake reason.
+        let sleep_clamshell = ClamshellState::Unknown;
+        if let Err(e) = mark_pending_wake_restore(sleep_clamshell) {
+            log_event(&format!(
+                "wake-recovery: could not persist inferred lid wake: {e}"
+            ));
+        }
+        pending = Some(PendingWakeRestore { sleep_clamshell });
+    }
+    let wake_reason_lid = wake
+        .as_ref()
+        .map(|w| w.lid)
+        .unwrap_or_else(|| read_wake_reason_contains_lid(verbose));
     let aggressive_lid_recovery = wake_reason_lid
         || pending
             .map(|pending| pending.sleep_clamshell != ClamshellState::Open)
@@ -1966,6 +2073,9 @@ fn run_wake_recovery_once(reason: &str, mode: ActionMode, verbose: bool) -> AppR
             mark_wake_auto_disable_hold()?;
         }
         clear_pending_wake_restore()?;
+        if let Some(wake) = wake {
+            wake.acknowledge();
+        }
         log_event(&format!(
             "wake-recovery: builtin active; cleared pending restore; auto_disable_hold={aggressive_lid_recovery}"
         ));
@@ -3018,6 +3128,9 @@ fn watch(args: Vec<String>) -> AppResult<()> {
         i += 1;
     }
 
+    if mode == ActionMode::Execute {
+        require_graphics_session()?;
+    }
     let saved_targets = if target.is_none() {
         load_targets()?
     } else {
@@ -3254,6 +3367,7 @@ fn set_displayplacer_enabled(
         return Ok(message);
     }
 
+    require_graphics_session()?;
     if verbose {
         println!("running: displayplacer \"{argument}\"");
     }
@@ -3292,6 +3406,7 @@ fn detect_displays(mode: ActionMode, verbose: bool) -> AppResult<()> {
         return Ok(());
     }
 
+    require_graphics_session()?;
     if verbose {
         println!("running: SLSDetectDisplays()");
     }
@@ -3339,9 +3454,18 @@ fn set_native_display_enabled(
         return Ok(());
     }
 
+    require_graphics_session()?;
     if verbose {
         println!("running: CGSConfigureDisplayEnabled(display_id:{display_id}, enabled:{enabled})");
     }
+    let caller = env::args_os()
+        .nth(1)
+        .unwrap_or_else(|| "interactive".into());
+    let source = format!(
+        "pid={} command={}",
+        std::process::id(),
+        caller.to_string_lossy()
+    );
     let mut config: CGDisplayConfigRef = std::ptr::null_mut();
     let begin = unsafe { CGBeginDisplayConfiguration(&mut config) };
     if begin != 0 {
@@ -3354,7 +3478,7 @@ fn set_native_display_enabled(
             CGCancelDisplayConfiguration(config);
         }
         log_event(&format!(
-            "cgs-configure: display_id={display_id} enabled={enabled} configure_err={configure}"
+            "cgs-configure: {source} display_id={display_id} enabled={enabled} configure_err={configure}"
         ));
         return Err(format!("CGSConfigureDisplayEnabled failed: {configure}").into());
     }
@@ -3362,13 +3486,13 @@ fn set_native_display_enabled(
     let complete = unsafe { CGCompleteDisplayConfiguration(config, K_CG_CONFIGURE_PERMANENTLY) };
     if complete != 0 {
         log_event(&format!(
-            "cgs-configure: display_id={display_id} enabled={enabled} complete_err={complete}"
+            "cgs-configure: {source} display_id={display_id} enabled={enabled} complete_err={complete}"
         ));
         return Err(format!("CGCompleteDisplayConfiguration failed: {complete}").into());
     }
 
     log_event(&format!(
-        "cgs-configure: display_id={display_id} enabled={enabled} ok"
+        "cgs-configure: {source} display_id={display_id} enabled={enabled} ok"
     ));
     Ok(())
 }
@@ -4664,6 +4788,19 @@ displayplacer "id:ABC enabled:true"
             restore_command: None,
             raw: String::new(),
         }
+    }
+
+    #[test]
+    fn failed_reconcile_retries_on_change_or_deadline() {
+        let now = Instant::now();
+        let failed = FailedReconcile {
+            activity: vec![(1, false)],
+            retry_at: now + Duration::from_secs(30),
+        };
+        assert!(failed.waiting(&[(1, false)], now + Duration::from_secs(5)));
+        assert!(!failed.waiting(&[(1, true)], now));
+        assert!(!failed.waiting(&[], now));
+        assert!(!failed.waiting(&[(1, false)], now + Duration::from_secs(30)));
     }
 
     #[test]

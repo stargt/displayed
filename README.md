@@ -142,7 +142,13 @@ skip the `displayplacer list` subprocesses and terminal redraw. Display and
 power events still trigger fresh checks. While wake recovery is pending, or if
 notification registration fails or the layout cannot be verified, the watcher
 keeps the full periodic check.
-Non-interactive watch uses the requested interval, defaulting to 60 seconds.
+Interactive and executing watch modes require a macOS graphical login session.
+A terminal allocated by a background job can lack access to WindowServer.
+In that session the watcher exits before it can issue display configuration
+requests. If a periodic recovery fails on an unchanged layout, another timer
+retry waits up to 30 seconds. A display event, power event or manual refresh
+clears that delay. Non-interactive watch uses the requested interval, defaulting
+to 60 seconds.
 
 ## Internal Display Guard
 
@@ -151,14 +157,26 @@ display and never rearranges displays. It restores the internal display only whe
 the lid permits recovery, no saved auto-target is connected, and the built-in
 itself is absent. A closed lid leaves the guard idle.
 
-Each run reads a fresh `displayplacer list` to identify connected saved targets,
-including a monitor in display sleep. A closed lid or a connected saved target
-already settles the periodic decision. Otherwise, a fresh CoreGraphics child
-checks whether the built-in belongs to the online display list. An enabled
-built-in remains online during display sleep. A probe failure counts as absent
-and allows recovery. Power-event diagnostics and failed display reads still
-request the full probe. Lid wake has a separate active-panel check because
-WindowServer can retain a pre-sleep display after the monitor is unplugged.
+The scheduled guard checks the lid and the current sleep/wake cycle. On a new
+lid wake it verifies the built-in panel and retries recovery on the next
+interval if necessary, even when no interactive watcher was running before
+sleep. A closed lid defers recovery. The guard and power callback serialize
+wake recovery.
+
+With the lid open, the guard identifies saved monitors from a fresh
+`displayplacer list`. For a lit saved DisplayPort monitor with a reported
+hardware serial, it can confirm the same physical link on later intervals
+through the I/O Registry. This requires an active source, hot-plug detect high,
+a single sink, a trained link and the same registry entry and serial as the
+last full check. It repeats the full check after five minutes. A missing or
+changed link, an unsupported monitor, a new wake cycle or an unreadable
+snapshot uses the full guard immediately. The one-shot guard needs no resident
+helper.
+
+If the saved external is absent, a fresh CoreGraphics child checks whether the
+built-in is online. This covers an enabled built-in in display sleep. A probe
+failure allows recovery. Lid wake separately verifies that the panel is active
+because WindowServer can retain a pre-sleep external after an unplug.
 
 The long-running watcher's restore path shares this signal: it will not restore
 the built-in while an external is present on the desktop, so a display-asleep
